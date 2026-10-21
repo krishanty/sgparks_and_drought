@@ -1,0 +1,1037 @@
+---
+title: "rasterification"
+author: "Intan Krishanty"
+date: "2026-10-06"
+output: html_document
+---
+
+Turning the parquet files into GeoTIFF with two bands: 1 for NDMI and 2 for NDVI. 
+One GeoTIFF per month per year for oct 2025 to sep 2026
+One GeoTIFF per month for all 5 years containing mean NDMI and NDVI per grid cell
+One GeoTIFF per month containing 
+- mean NDMI and NDVI per grid cell 
+- assigned precipitation 
+- air temperature
+KIV:
+- land use:
+    - park: 0/1
+    - reserve: 0/1
+Mask out water bodies 
+
+Load the required libraries:
+```{r}
+library(reticulate)
+library(tidyverse)
+library(sf)
+library(here)
+library(duckdb)
+library(terra)
+library(DBI)
+```
+
+# Step 1: Load parquet files and save as GeoTIFF
+
+Setting up duckDB connection
+
+```{r}
+duck_con <- dbConnect(duckdb())
+
+dbExecute(duck_con, "SET memory_limit = '8GB'")
+dbExecute(duck_con, "SET threads = 2")
+dbExecute(duck_con, "SET preserve_insertion_order = false")
+
+dir.create(
+  here("data", "duckdb_temp"),
+  showWarnings = FALSE
+)
+
+temp_path <- normalizePath(
+  here("data", "duckdb_temp")
+)
+
+dbExecute(
+  duck_con,
+  paste0(
+    "SET temp_directory = '",
+    temp_path,
+    "'"
+  )
+)
+```
+Lazy-loading parquet files
+```{r}
+dbExecute(
+  duck_con,
+  "
+  CREATE OR REPLACE VIEW nd_data AS
+  SELECT *
+  FROM read_parquet('data/processed/*.parquet')
+  "
+)
+
+dataset_view <- tbl(duck_con, "nd_data")
+
+```
+
+Let's define a master raster file:
+
+```{r}
+sg_bounds <- st_read(
+    here("data/shp/regionBound.geojson")
+)
+
+sg_utm <- sg_bounds |>
+    st_transform(32648) |>
+    st_make_valid()
+
+sg_outline_utm <- st_union(sg_utm)
+
+sg_vect <- terra::vect(sg_outline_utm)
+
+pixel_locations <- DBI::dbGetQuery(
+    duck_con,
+    "
+    SELECT DISTINCT x, y
+    FROM read_parquet('data/processed/*.parquet')
+    "
+)
+
+hls_grid <- pixel_locations |>
+    mutate(template = 1)
+
+hls_template <- rast(
+    hls_grid[, c("x", "y", "template")],
+    type = "xyz",
+    crs = "EPSG:32648"
+)
+
+hls_template <- mask(
+    hls_template,
+    sg_vect
+)
+
+template_output_path = "data/geotiff/template/hls_singapore_template.tif"
+
+dir.create(dirname(here(template_output_path)), recursive = TRUE, showWarnings = FALSE)
+
+terra::writeRaster(
+    hls_template,
+    here(template_output_path),
+    overwrite = TRUE
+)
+```
+Create a function that will loop through number of years 2020-2026, and then loop through months 1 to 12 
+use master raster at `template_output_path`
+
+Directory:
+`data/geotiff/ndvimi/individual_years/{year}/{month}`
+
+Bands: 
+1. NDVI
+2. NDMI
+3. Number of NDVI observations
+4. Number of NDMI observations
+
+```{r}
+create_monthly_nd_rasters <- function(
+    duck_con,
+    template_output_path,
+    years = 2020:2026,
+    months = 1:12){
+  template <- terra::rast(template_output_path)
+  for (yr in years) {
+    for (mo in months) {
+      message("Processing ",yr, "-",sprintf("%02d", mo))
+      query <- sprintf(
+        "
+        SELECT
+            x,
+            y,
+            AVG(NDVI) AS NDVI,
+            AVG(NDMI) AS NDMI,
+            COUNT(NDVI) AS NDVI_nobs,
+            COUNT(NDMI) AS NDMI_nobs
+        FROM read_parquet('data/processed/*.parquet')
+        WHERE
+            year(date) = %d
+            AND month(date) = %d
+        GROUP BY
+            x,
+            y
+        ",
+        yr,
+        mo
+      )
+      monthly_df <- DBI::dbGetQuery(duck_con,query)
+      if (nrow(monthly_df) == 0) {
+        message("No data found. Skipping.")
+        next
+      }
+      monthly_raster <- terra::rast(
+        monthly_df[,c("x","y","NDVI","NDMI","NDVI_nobs","NDMI_nobs")],
+        type = "xyz",
+        crs = "EPSG:32648")
+
+      names(monthly_raster) <- c("NDVI","NDMI","NDVI_nobs","NDMI_nobs")
+
+      if (!terra::compareGeom(monthly_raster,template,stopOnError = FALSE)){
+        monthly_raster <- terra::resample(monthly_raster,template,method = "near")}
+
+      monthly_raster <- terra::mask(monthly_raster,template)
+      
+      output_dir <- here("data","geotiff","ndvimi","individual_years",as.character(yr))
+
+      dir.create(output_dir,recursive = TRUE,showWarnings = FALSE)
+
+      output_file <- file.path(output_dir,sprintf("NDVI_NDMI_%d_%02d.tif",yr,mo))
+
+      terra::writeRaster(monthly_raster,output_file,overwrite = TRUE,wopt = list(gdal = c("COMPRESS=DEFLATE","TILED=YES")))
+
+      message(output_file, " done.")
+
+      rm(monthly_df,monthly_raster)
+      gc()
+    }
+  }
+  invisible(NULL)
+}
+```
+
+Run the function:
+
+```{r}
+template_output_path = "data/geotiff/template/hls_singapore_template.tif"
+create_monthly_nd_rasters(duck_con,template_output_path, year=2026:2026, months=1:9)
+```
+# Step 2: Save the average for 2020-2025 for each month (2020 to 2025 Sep) in a separate GeoTIFF layer
+Directory: 
+`data/geotiff/ndvimi/average/{month}`
+Band 1 = mean monthly NDVI across available years
+Band 2 = mean monthly NDMI across available years
+Band 3 = number of years contributing NDVI
+Band 4 = number of years contributing NDMI
+
+```{r}
+create_avg_monthly_nd_rasters <- function(
+    template_output_path,
+    individual_years_dir){
+  template <- terra::rast(template_output_path)
+  #  to get the average we need to loop through each month and find the list of files inside each year directory
+  months = 1:12
+  years_dirs <- list.dirs(path = individual_years_dir, recursive = FALSE, full.names = TRUE)
+  years <- as.integer(basename(years_dirs))
+  for (month in months){
+      if (month <= 9){
+        years <- 2021:2025
+    } else{
+        years <- 2020:2024
+    }
+    # construct file name looping through the dir and find if that file exists
+    # if file does not exist, continue
+      message("Checking month ", month)
+      tif_paths <- character()
+      for(year in years){
+          # check if this file exists
+          check_file_path <- file.path(individual_years_dir, as.character(year), sprintf("NDVI_NDMI_%d_%02d.tif",year,month))
+          if (file.exists(check_file_path)){
+              message(sprintf("File NDVI_NDMI_%d_%02d.tif exists",year,month))
+              # add this to the list
+              tif_paths <- c(tif_paths,check_file_path)
+          } else{
+              message(sprintf("File NDVI_NDMI_%d_%02d.tif does NOT exist",year,month))
+          }
+      }
+      if (length(tif_paths) == 0) {
+        message("No rasters available for month ",month)
+        next
+      }
+    yearly_rasters <- lapply(tif_paths,terra::rast)
+    geometry_ok <- vapply(yearly_rasters,function(r){terra::compareGeom(r,template,stopOnError = FALSE)},logical(1))
+    if (!all(geometry_ok)) {
+        stop("Raster geometry mismatch for month ",mo)
+    }
+    
+    ndvi_stack <- terra::rast(lapply(yearly_rasters,function(r) r[["NDVI"]]))
+    ndmi_stack <- terra::rast(lapply(yearly_rasters,function(r) r[["NDMI"]]))
+    mean_ndvi <- terra::app(ndvi_stack,fun = mean,na.rm = TRUE)
+    mean_ndmi <- terra::app(ndmi_stack,fun = mean,na.rm = TRUE)
+    n_years_ndvi <- terra::app(ndvi_stack,fun = function(x){sum(!is.na(x))})
+    n_years_ndmi <- terra::app(ndmi_stack,fun = function(x) {sum(!is.na(x))})
+    historical_raster <- c(mean_ndvi,mean_ndmi,n_years_ndvi,n_years_ndmi)
+    names(historical_raster) <- c("NDVI","NDMI","NDVI_nyears","NDMI_nyears")
+
+    output_dir <- here("data","geotiff","ndvimi","average")
+    dir.create(output_dir,recursive = TRUE,showWarnings = FALSE)
+    output_file <- file.path(output_dir,sprintf("NDVI_NDMI_average_%d.tif",month))
+    terra::writeRaster(historical_raster,output_file,overwrite = TRUE,wopt = list(gdal = c("COMPRESS=DEFLATE","TILED=YES")))
+    message(output_file, " done.")
+    rm(yearly_rasters,ndvi_stack,ndmi_stack,mean_ndvi,mean_ndmi,n_years_ndvi,n_years_ndmi,historical_raster)
+    gc()
+
+}
+invisible(NULL)
+  }
+  
+```
+
+Run the function now:
+
+```{r}
+template_output_path = "data/geotiff/template/hls_singapore_template.tif"
+individual_years_dir = "data/geotiff/ndvimi/individual_years"
+create_avg_monthly_nd_rasters(template_output_path,individual_years_dir)
+```
+
+Just for checking, let's generate the map again using the rasters we've made:
+
+```{r}
+average_path <- "data/geotiff/ndvimi/average"
+average_files <- list.files(average_path)
+average_paths<- file.path(average_path, average_files)
+average_rasters <- lapply(average_paths,terra::rast)
+ndvi_stack <- terra::rast(lapply(average_rasters,function(r) r[["NDVI"]]))
+ndmi_stack <- terra::rast(lapply(average_rasters,function(r) r[["NDMI"]]))
+names(ndvi_stack) <- month.abb
+names(ndmi_stack) <- month.abb
+
+ndvi_df <- as.data.frame(
+    ndvi_stack,
+    xy = TRUE,
+    na.rm = TRUE
+)
+
+ndvi_df <- ndvi_df |>
+    pivot_longer(
+        cols = -c("x", "y"),
+        names_to = "month",
+        values_to = "NDVI"
+    ) |>
+    mutate(
+        month = as.factor(month)
+    )
+
+ndvi_mean_plot <- ggplot(ndvi_df, aes(x=x, y=y, fill =NDVI)) +
+    geom_tile(
+        width = 30,
+        height = 30
+    ) +
+    facet_wrap(~month, ncol=4) +
+    scale_fill_viridis_c() +
+    coord_equal() +
+    theme_minimal() +
+    labs(title = "Historical Monthly Mean NDVI",
+         subtitle = "5-year baseline, October 2020–September 2025",
+         x= NULL,
+         y = NULL,
+         fill = "Mean NDVI")
+
+
+```
+
+# Step 3: NDVI and NDMI difference for 2026 and 2025 Oct - Dec
+
+Directory: 
+`data/geotiff/ndvimi/difference/{month}`
+
+Simple: loop through 1:12. If month > 9, then check the 2025 dir otherwise keep to the 2026 dir. 
+In each month loop, take the NDMI and NDVI average and the 2026/2025 rasters, subtract the bands.
+
+```{r}
+average_path <- "data/geotiff/ndvimi/average"
+average_files <- list.files(average_path)
+individual_path_base <- "data/geotiff/ndvimi/individual_years"
+
+for (month in 1:12){
+    if (month <= 9){
+        current_year <- 2026
+    } else{
+        current_year <- 2025
+    }
+    individual_path <- file.path(individual_path_base, as.character(current_year))
+    # get the correct average file
+    average_file <- file.path(average_path, sprintf("NDVI_NDMI_average_%d.tif", month))
+    current_file <- file.path(individual_path, sprintf("NDVI_NDMI_%d_%02d.tif", current_year, month))
+    average_raster <- terra::rast(average_file)
+    current_raster <- terra::rast(current_file)
+    average_file_ndvi <- average_raster[["NDVI"]]
+    average_file_ndmi <- average_raster[["NDMI"]]
+    current_file_ndvi <- current_raster[["NDVI"]]
+    current_file_ndmi <- current_raster[["NDMI"]]
+    
+    ndmi_diff <- current_file_ndmi - average_file_ndmi
+    ndvi_diff <- current_file_ndvi - average_file_ndvi
+    ndvi_diff[average_raster[["NDVI_nyears"]] < 3] <- NA
+    ndmi_diff[average_raster[["NDMI_nyears"]] < 3] <- NA
+    diff_raster <- c(ndvi_diff, ndmi_diff)
+    names(diff_raster) <- c("NDVI_diff", "NDMI_diff")
+    
+    output_dir <- here("data","geotiff","ndvimi","difference")
+    dir.create(output_dir,recursive = TRUE,showWarnings = FALSE)
+    output_file <- file.path(output_dir,sprintf("NDVI_NDMI_diff_%d.tif",month))
+    terra::writeRaster(diff_raster,output_file,overwrite = TRUE,wopt = list(gdal = c("COMPRESS=DEFLATE","TILED=YES")))
+    message(output_file, " done.")
+    rm(average_raster, current_raster)
+    gc()
+}
+```
+
+and now plot them again to check:
+
+```{r}
+diff_path <- "data/geotiff/ndvimi/difference"
+diff_files <- file.path(diff_path,sprintf("NDVI_NDMI_diff_%d.tif", 1:12))
+
+diff_rasters <- lapply(diff_files,terra::rast)
+ndvi_diff_stack <- terra::rast(lapply(diff_rasters,function(r) r[["NDVI_diff"]]))
+ndmi_diff_stack <- terra::rast(lapply(diff_rasters,function(r) r[["NDMI_diff"]]))
+names(ndvi_diff_stack) <- month.abb
+names(ndmi_diff_stack) <- month.abb
+month_order <- c(
+    "Oct", "Nov", "Dec",
+    "Jan", "Feb", "Mar",
+    "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep"
+)
+
+ndvi_diff_df <- purrr::map_dfr(1:12,function(i){
+        df <- terra::as.data.frame(ndvi_diff_stack[[i]],xy = TRUE,na.rm = TRUE)
+        names(df) <- c("x", "y", "NDVI_diff")
+        df$month <- month.abb[i]
+        df}) |>
+    mutate(month = factor(month, levels = month_order))
+
+ndvi_diff_df <- ndvi_diff_df |> filter(!is.na(NDVI_diff))
+
+ndmi_diff_df <- purrr::map_dfr(1:12,function(i){
+        df <- terra::as.data.frame(ndmi_diff_stack[[i]],xy = TRUE,na.rm = TRUE)
+        names(df) <- c("x", "y", "NDMI_diff")
+        df$month <- month.abb[i]
+        df}) |>
+    mutate(month = factor(month, levels = month_order))
+
+ndmi_diff_df <- ndmi_diff_df |> filter(!is.na(NDMI_diff))
+
+ndvi_limit <- quantile(
+    abs(ndvi_diff_df$NDVI_diff),
+    probs = 0.98,
+    na.rm = TRUE
+)
+ndmi_limit <- quantile(
+    abs(ndmi_diff_df$NDMI_diff),
+    probs = 0.98,
+    na.rm = TRUE
+)
+
+ndvi_diff_plot <- ggplot(ndvi_diff_df, aes(x=x, y=y, fill = NDVI_diff)) +
+    geom_tile(
+        width = 30,
+        height = 30
+    ) +
+    facet_wrap(~month, ncol=4) +
+    scale_fill_gradient2(
+    low = "darkred",
+    mid = "white",
+    high = "darkgreen",
+    midpoint = 0,
+    limits = c(-ndvi_limit, ndvi_limit),
+    oob = scales::squish,
+    na.value = "grey90") +
+    coord_equal() +
+    theme_minimal() +
+    labs(title = "Monthly Mean NDVI Anomaly, October 2025 - September 2026",
+         subtitle = "Compared to at least 3-years mean from October 2020–September 2025",
+         x= NULL,
+         y = NULL,
+         fill = "Delta NDVI")
+
+ndmi_diff_plot <- ggplot(ndmi_diff_df, aes(x=x, y=y, fill = NDMI_diff)) +
+    geom_tile(
+        width = 30,
+        height = 30
+    ) +
+    facet_wrap(~month, ncol=4) +
+    scale_fill_gradient2(
+    low = "sienna4",
+    mid = "white",
+    high = "dodgerblue4",
+    midpoint = 0,
+    limits = c(-ndmi_limit, ndmi_limit),
+    oob = scales::squish,
+    na.value = "grey90") +
+    coord_equal() +
+    theme_minimal() +
+    labs(title = "Monthly Mean NDMI Anomaly, October 2025 - September 2026",
+         subtitle = "Compared to at least 3-years mean from October 2020–September 2025",
+         x= NULL,
+         y = NULL,
+         fill = "Delta NDMI")
+```
+
+let's mask out anything that is above 0 to see where the below average NDMI and NDVI are:
+
+```{r}
+ndmi_masked <- ndmi_diff_df[ndmi_diff_df$NDMI_diff < 0, ]
+
+ndmi_masked_plot <- ggplot(ndmi_masked, aes(x=x, y=y, fill = NDMI_diff)) +
+    geom_tile(
+        width = 30,
+        height = 30
+    ) +
+    facet_wrap(~month, ncol=4) +
+    scale_fill_gradient2(
+    low = "red4",
+    mid = "red3",
+    high = "sienna1",
+    limits = c(-1, 0),
+    oob = scales::squish,
+    na.value = "grey90") +
+    coord_equal() +
+    theme_minimal() +
+    labs(title = "Monthly Mean NDMI Anomaly, October 2025 - September 2026 (negative only)",
+         subtitle = "Compared to at least 3-years mean from October 2020–September 2025",
+         x= NULL,
+         y = NULL,
+         fill = "Delta NDMI")
+
+
+ndvi_masked <- ndvi_diff_df[ndvi_diff_df$NDVI_diff < 0, ]
+
+ndvi_masked_plot <- ggplot(ndvi_masked, aes(x=x, y=y, fill = NDVI_diff)) +
+    geom_tile(
+        width = 30,
+        height = 30
+    ) +
+    facet_wrap(~month, ncol=4) +
+    scale_fill_gradient2(
+    low = "red4",
+    mid = "red3",
+    high = "sienna1",
+    limits = c(-1, 0),
+    oob = scales::squish,
+    na.value = "grey90") +
+    coord_equal() +
+    theme_minimal() +
+    labs(title = "Monthly Mean NDVI Anomaly, October 2025 - September 2026 (negative only)",
+         subtitle = "Compared to at least 3-years mean from October 2020–September 2025",
+         x= NULL,
+         y = NULL,
+         fill = "Delta NDVI")
+```
+
+# Step 4: Assign closest weather station data for precipitation and air temp 
+
+Directory: 
+`data/geotiff/weather/averaged/{month}`
+
+## Precipitation
+
+Load the precipitation dataset:
+
+```{r}
+file_paths <- list.files(path = here("data"), 
+                         pattern = "rain202.*\\.csv$", 
+                         full.names = TRUE)
+precip_old_old <- read_csv(file_paths)
+precip_old <- read_csv("data/sg_rainfall_historical.csv")
+precip_new <- read_csv("data/precip2026_marchonwards.csv")
+precip_df <- bind_rows(precip_old_old, precip_old, precip_new) |>
+    select(-c("reading_update_timestamp", "reading_type")) |>
+    mutate(station_id = as.factor(station_id)) |>
+    filter(date > "2020-09-30")
+```
+
+QC of the precip data to see if stations report consistently
+- group by date, lon and lat
+- get total no. of readings
+- sum is.na for each lon and lat and sum(!is.na)
+- total readings should be 24 * (60/5) = 288 readings per station per day
+
+
+```{r}
+precip_coverage <- precip_df |>
+    group_by(date, location_longitude,location_latitude)|>
+    summarise(n_readings = n(),
+              valid_readings = sum(!is.na(reading_value)),
+              invalid_readings = sum(is.na(reading_value)))|>
+    mutate(daily_reading_coverage = n_readings/288 *100,
+           daily_valid_coverage = valid_readings / 288 * 100)
+
+range(precip_coverage$daily_reading_coverage)
+range(precip_coverage$daily_valid_coverage)
+
+precip_coverage_bin <- precip_coverage |>
+    mutate(bin_reading_coverage = cut(daily_reading_coverage, breaks = c(0, 50, 75, 90, 95, 100),
+            include.lowest = TRUE),
+           bin_valid_coverage = cut(daily_valid_coverage, breaks = c(0, 50, 75, 90, 95, 100),
+            include.lowest = TRUE))
+
+# ggplot(data=precip_coverage_bin, aes(x=bin_reading_coverage)) + geom_bar()
+# ggplot(data=precip_coverage_bin, aes(x=bin_valid_coverage)) + geom_bar()
+
+station_location_check <- precip_df |>
+    filter(
+        !is.na(station_id),
+        !is.na(location_longitude),
+        !is.na(location_latitude)
+    ) |>
+    distinct(
+        station_id,
+        location_longitude,
+        location_latitude
+    ) |>
+    count(
+        station_id,
+        name = "n_locations"
+    ) |>
+    arrange(desc(n_locations))
+
+station_location_check |>
+    filter(n_locations > 1)
+
+```
+
+For precip data, we want to get the monthly means of the following FOR EACH STATION:
+- cumulative sum for the month in mm
+- sum for the day and then mean daily sum rainfall for that month 
+
+A rain day is a day that records 0.2mm day or more
+```{r}
+precip_df <- precip_df |>
+    drop_na(location_longitude,location_latitude)
+
+precip_daily <- precip_df |>
+    filter(!is.na(station_id)) |>
+    group_by(station_id,date,)|>
+    summarise(daily_sum = sum(reading_value, na.rm = TRUE),
+              n_readings = sum(!is.na(reading_value)),
+              .groups = "drop")
+
+precip_monthly <- precip_daily |>
+    group_by(station_id, year = lubridate::year(date),month = lubridate::month(date))|>
+    summarise(mean_monthly_daily_sum = mean(daily_sum, na.rm = TRUE),
+              cumulative_monthly = sum(daily_sum, na.rm = TRUE),
+              valid_days = sum(n_readings > 0),
+              rainy_days = sum(daily_sum >= 0.2 & n_readings > 0),
+              .groups = "drop")
+
+station_location <- precip_df |>
+    filter(!is.na(station_id), !is.na(location_latitude), !is.na(location_longitude))|>
+    group_by(station_id, location_longitude, location_latitude) |>
+    summarise(first_date = min(date), last_date = max(date), .groups="drop")
+
+station_location_canon <- station_location |>
+    group_by(station_id) |>
+    slice_min(order_by = first_date, n =1, with_ties = FALSE) |>
+    ungroup() |> 
+    select(-c("first_date", "last_date"))
+
+precip_monthly_spatial <- precip_monthly |>
+    left_join(station_location_canon, by = "station_id", relationship = "many-to-one")
+
+stations <- station_location_canon |>
+    arrange(station_id) |>
+    mutate(station_code = row_number())
+    
+```
+
+Make a GeoTIFF file for every month with the following bands for those pixels:
+- monthly mean daily sum 
+- cumulative monthly 
+
+First, create a permanent weather station look up raster:
+1. extract the locations by removing NAs, getting unique coords and assigning station codes through row numbers
+2. Turn it into spatial points with coordinates using sf
+```{r}
+template_output_path = "data/geotiff/template/hls_singapore_template.tif"
+template <- terra::rast(template_output_path)
+
+stations_sf <- st_as_sf(stations,
+                      coords = c("location_longitude", "location_latitude"),
+                      crs = 4326, remove=FALSE)
+
+stations_utm <- st_transform(stations_sf, crs=terra::crs(template))
+
+stations_vect <- terra::vect(stations_utm)
+```
+
+3. create voronoi polygon
+4. rasterise onto the SG template grid
+
+```{r}
+station_voronoi <- terra::voronoi(stations_vect)
+
+nearest_station <- terra::rasterize(station_voronoi, template, field="station_code")
+
+nearest_station <- terra::mask(nearest_station, template)
+
+names(nearest_station) <- "station_code"
+
+terra::writeRaster(nearest_station, "data/geotiff/template/precip_stations.tif", overwrite=TRUE)
+```
+
+join precip_monthly with stations_df:
+```{r}
+precip_monthly <- precip_monthly |>
+              left_join(stations |> select("station_code", "location_latitude", "location_longitude", "station_id"), by = "station_id", relationship = "many-to-one") |>
+    filter(!is.na(location_longitude),
+           !is.na(location_latitude),
+           !is.na(station_code))
+```
+
+create the monthly precip rasters:
+
+```{r}
+create_monthly_precip_rasters <- function(
+    precip_monthly,
+    template_output_path,
+    nearest_station_path,
+    years = 2020:2026,
+    months = 1:12){
+  template <- terra::rast(template_output_path)
+  nearest_station <-terra::rast(nearest_station_path)
+  # check if nearest station path geom matches template geom 
+  if (!terra::compareGeom(template,nearest_station,stopOnError=FALSE)){
+      stop("Nearest-station raster does not match template.")
+  }
+  
+  for (yr in years) {
+      message("Checking year", yr)
+      precip_year <- precip_monthly|>
+          filter(year == yr)
+      
+      for (mo in months){
+          message("Checking month", mo)
+          precip_month <- precip_year |>
+              filter(month == mo)
+          if (nrow(precip_month) == 0){
+              message("No data for this month. Skipping.")
+              next
+          }
+          precip_month <- precip_month |>
+              select(station_code, mean_monthly_daily_sum, cumulative_monthly, valid_days, rainy_days)
+          layers <- lapply(c("mean_monthly_daily_sum", "cumulative_monthly", "valid_days", "rainy_days"), function(var){
+              lookup <-precip_month |> select(station_code, all_of(var))
+              rainfall <- terra::subst(nearest_station, from = lookup$station_code, to =lookup[[var]], others = NA)
+              names(rainfall) <- var
+              return(rainfall)
+          })
+          monthly_raster <- do.call(c, layers)
+          monthly_raster <- terra::mask(monthly_raster,template)
+          output_dir <- here("data","geotiff","climate","precip","individual_years",as.character(yr))
+          dir.create(output_dir,recursive = TRUE,showWarnings = FALSE)
+          output_file <- file.path(output_dir,sprintf("precip_station_monthly_%d_%02d.tif",yr,mo))
+          terra::writeRaster(monthly_raster,output_file,overwrite = TRUE,wopt = list(gdal = c("COMPRESS=DEFLATE","TILED=YES")))
+          message(output_file, " done.")
+          rm(monthly_raster, layers)
+          gc()
+      }
+  }
+    invisible(NULL)
+}
+```
+call the function:
+```{r}
+template_output_path = "data/geotiff/template/hls_singapore_template.tif"
+nearest_station_path = "data/geotiff/template/precip_stations.tif"
+create_monthly_precip_rasters(precip_monthly, template_output_path, nearest_station_path)
+```
+
+QC:
+```{r}
+test_2026_apr <- rast("data/geotiff/climate/precip/individual_years/2026/precip_station_monthly_2026_01.tif")
+plot(test_2026_apr)
+
+```
+
+QC template:
+```{r}
+template <- terra::rast(template_output_path)
+
+nearest_station <- terra::rast(
+    here("data/geotiff/template/precip_stations.tif")
+)
+
+terra::plot(template, main = "Singapore master template")
+
+terra::plot(
+    nearest_station,
+    main = "Nearest weather station"
+)
+```
+
+## Temperature
+
+Load the temp dataset:
+
+```{r}
+file_paths <- list.files(path = here("data"), 
+                         pattern = "temp202.*\\.csv$", 
+                         full.names = TRUE)
+
+temp_df <- read_csv(file_paths, id = "file_source") |>
+    select(-c("update_timestamp", "station_device_id", "reading_update_timestamp", "reading_type", "reading_unit"))|>
+    mutate(station_id = as.factor(station_id)) |>
+    filter(date > "2020-09-30")
+
+```
+
+For temp data, we're interested in monthly means of the following for each station:
+
+## Extend the data to the gaps
+
+For every month of every year. 
+
+Write function that is going to be applied to every pixel. Loop through the unique list of weather stations for precip and temp. Find the closest one. Assign the data in them. 
+
+Save the raster file. 
+
+Directory: 
+`data/geotiff/weather/individual_years/precip/`
+`data/geotiff/weather/individual_years/temp/`
+
+# Step 5: precip and airtemp difference for 2026 and 2025 Oct - Dec
+
+## Find average 
+
+Directory: 
+`data/geotiff/weather/average`
+
+Plot to check just in case
+
+## Difference for each month 
+
+Directory: 
+`data/geotiff/weather/difference`
+
+Plot to check just in case
+
+# Step 6: Land use layer 
+
+Loading the URA masterplan 2025 LU:
+```{r}
+lu <- read_sf(here("data/shp/LU.geojson"))
+```
+
+I want to mask out water bodies, let's pull out waterbody from the `lu`
+
+```{r}
+waterbody <- lu[lu$LU_DESC == "WATERBODY",]
+```
+
+masking out water bodies:
+
+```{r}
+output_dir <- here("data","geotiff","ndvimi","difference_watermasked")
+dir.create(output_dir,recursive = TRUE,showWarnings = FALSE)
+
+# load the diff rasters
+waterbody_transformed <- st_transform(waterbody, crs ="EPSG:32648")
+waterbody_vect <- terra::vect(waterbody_transformed)
+diff_path <- "data/geotiff/ndvimi/difference"
+diff_files <- list.files(diff_path)
+
+# loop through each diff_raster
+for (d in diff_files){
+    # mask out water bodies 
+    diff_raster <- terra::rast(file.path(diff_path,d))
+    watermasked_raster <- terra::mask(diff_raster,waterbody_vect,inverse = TRUE)
+    file_name <- str_sub(d, end = -5)
+    file_path <- paste0(output_dir, "/", file_name, "_watermasked.tif")
+    terra::writeRaster(watermasked_raster,filename=file_path,overwrite = TRUE,wopt = list(gdal = c("COMPRESS=DEFLATE","TILED=YES")))
+    message(file_path, " written")
+    rm(diff_raster, watermasked_raster)
+    gc()
+}
+
+```
+
+gonna plot to check:
+
+```{r}
+diff_path <- "data/geotiff/ndvimi/difference_watermasked"
+diff_watermasked_files <- c(file.path(diff_path,sprintf("NDVI_NDMI_diff_%d_watermasked.tif",1:9)),file.path(diff_path,sprintf("NDVI_NDMI_diff_%d_watermasked.tif",10:12)))
+diff_watermasked_rasters <- lapply(diff_watermasked_files,terra::rast)
+ndvi_diff_watermasked_stack <- terra::rast(lapply(diff_watermasked_rasters,function(r) r[["NDVI_diff"]]))
+ndmi_diff_watermasked_stack <- terra::rast(lapply(diff_watermasked_rasters,function(r) r[["NDMI_diff"]]))
+names(ndvi_diff_watermasked_stack) <- month.abb
+names(ndmi_diff_watermasked_stack) <- month.abb
+month_order <- c(
+    "Oct", "Nov", "Dec",
+    "Jan", "Feb", "Mar",
+    "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep"
+)
+
+ndvi_diff_watermasked_df <- purrr::map_dfr(1:12,function(i){
+        df <- terra::as.data.frame(ndvi_diff_watermasked_stack[[i]],xy = TRUE,na.rm = TRUE)
+        names(df) <- c("x", "y", "NDVI_diff")
+        df$month <- month.abb[i]
+        df}) |>
+    mutate(month = factor(month, levels = month_order))
+
+ndvi_diff_watermasked_df <- ndvi_diff_watermasked_df |> filter(!is.na(NDVI_diff))
+
+ndmi_diff_watermasked_df <- purrr::map_dfr(1:12,function(i){
+        df <- terra::as.data.frame(ndmi_diff_watermasked_stack[[i]],xy = TRUE,na.rm = TRUE)
+        names(df) <- c("x", "y", "NDMI_diff")
+        df$month <- month.abb[i]
+        df}) |>
+    mutate(month = factor(month, levels = month_order))
+
+ndmi_diff_watermasked_df <- ndmi_diff_watermasked_df |> filter(!is.na(NDMI_diff))
+
+ndvi_limit_watermasked <- quantile(
+    abs(ndvi_diff_watermasked_df$NDVI_diff),
+    probs = 0.98,
+    na.rm = TRUE
+)
+ndmi_limit_watermasked <- quantile(
+    abs(ndmi_diff_watermasked_df$NDMI_diff),
+    probs = 0.98,
+    na.rm = TRUE
+)
+
+ndvi_diff_watermasked_plot <- ggplot(ndvi_diff_watermasked_df, aes(x=x, y=y, fill = NDVI_diff)) +
+    geom_tile(
+        width = 30,
+        height = 30
+    ) +
+    facet_wrap(~month, ncol=4) +
+    scale_fill_gradient2(
+    low = "darkred",
+    mid = "white",
+    high = "darkgreen",
+    midpoint = 0,
+    limits = c(-ndvi_limit, ndvi_limit),
+    oob = scales::squish,
+    na.value = "grey90") +
+    coord_equal() +
+    theme_minimal() +
+    labs(title = "Monthly Mean NDVI Anomaly, October 2025 - September 2026 with water body masked out",
+         subtitle = "Compared to at least 3-years mean from October 2020–September 2025",
+         x= NULL,
+         y = NULL,
+         fill = "Delta NDVI")
+
+ndmi_diff_watermasked_plot <- ggplot(ndmi_diff_watermasked_df, aes(x=x, y=y, fill = NDMI_diff)) +
+    geom_tile(
+        width = 30,
+        height = 30
+    ) +
+    facet_wrap(~month, ncol=4) +
+    scale_fill_gradient2(
+    low = "sienna4",
+    mid = "white",
+    high = "dodgerblue4",
+    midpoint = 0,
+    limits = c(-ndmi_limit, ndmi_limit),
+    oob = scales::squish,
+    na.value = "grey90") +
+    coord_equal() +
+    theme_minimal() +
+    labs(title = "Monthly Mean NDMI Anomaly, October 2025 - September 2026 with water body masked out",
+         subtitle = "Compared to at least 3-years mean from October 2020–September 2025",
+         x= NULL,
+         y = NULL,
+         fill = "Delta NDMI")
+```
+
+This is just for saving all the plots
+
+```{r}
+ggsave("plots/ndvi_diff.png", plot = ndvi_diff_plot, width = 10, height = 5.625, units = "in", dpi = 300)
+ggsave("plots/ndmi_diff.png", plot = ndmi_diff_plot, width = 10, height = 5.625, units = "in", dpi = 300)
+ggsave("plots/ndvi_diff_wm.png", plot = ndvi_diff_watermasked_plot, width = 10, height = 5.625, units = "in", dpi = 300)
+ggsave("plots/ndmi_diff_wm.png", plot = ndmi_diff_watermasked_plot, width = 10, height = 5.625, units = "in", dpi = 300)
+```
+QC
+```{r}
+par(mfrow = c(1, 3))
+
+terra::plot(
+    current[["NDVI"]],
+    main = "March 2026 NDVI",
+    col = hcl.colors(100, "RdYlGn")
+)
+
+terra::plot(
+    baseline[["NDVI"]],
+    main = "Historical March NDVI",
+    col = hcl.colors(100, "RdYlGn")
+)
+
+terra::plot(
+    difference[["NDVI_diff"]],
+    main = "March 2026 anomaly",
+    col = hcl.colors(100, "RdBu", rev = TRUE)
+)
+
+par(mfrow = c(1, 1))
+range = c(-1, 1)
+```
+
+QC2
+```{r}
+comparison_df <- terra::as.data.frame(
+    c(
+        current[["NDVI"]],
+        baseline[["NDVI"]],
+        difference[["NDVI_diff"]]
+    ),
+    xy = TRUE,
+    na.rm = FALSE
+)
+
+names(comparison_df) <- c(
+    "x", "y",
+    "current_ndvi",
+    "baseline_ndvi",
+    "ndvi_diff"
+)
+
+comparison_df |>
+    filter(!is.na(ndvi_diff)) |>
+    summarise(
+        mean_current = mean(current_ndvi),
+        mean_baseline = mean(baseline_ndvi),
+        mean_difference = mean(ndvi_diff),
+        correlation = cor(current_ndvi, baseline_ndvi)
+    )
+
+comparison_df |>
+    filter(
+        !is.na(ndvi_diff)
+    ) |>
+    ggplot(
+        aes(
+            x = baseline_ndvi,
+            y = current_ndvi
+        )
+    ) +
+    geom_hex(bins = 60) +
+    geom_abline(
+        slope = 1,
+        intercept = 0,
+        linetype = "dashed",
+        colour = "red"
+    ) +
+    scale_fill_viridis_c() +
+    coord_equal(
+        xlim = c(-1, 1),
+        ylim = c(-1, 1)
+    ) +
+    labs(
+        x = "Historical March NDVI",
+        y = "March 2026 NDVI",
+        fill = "Pixel count",
+        title = "March 2026 vs Historical NDVI"
+    ) +
+    theme_minimal()
+```
+
+# Penultimate step: Distill into csv file if needed
+
+# Final step: close duckDB connection
+```{r}
+dbDisconnect(duck_con, shutdown = TRUE)
+```

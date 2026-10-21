@@ -1,0 +1,14 @@
+.netrc
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+.DS_Store
+.RDataTmp
+.RDataTmp1
+.Renviron
+.Rprofile
+.edl_token
+.netr
+plots/
+data/

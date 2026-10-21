@@ -1,0 +1,1366 @@
+---
+title: "NDMI, NDVI, Precipitation and Air Temperature Data Exploration"
+author: "Intan Krishanty"
+date: "2026-10-01"
+output: html_document
+---
+
+
+```{r}
+library(reticulate)
+library(here)
+library(tidyverse)
+library(sf)
+```
+# NDMI and NDVI data acquisition
+
+## Download HLS30V1 from earthaccess with Python 
+
+- mask against Singapore shp
+- index each tile
+- parquet file 
+
+```{python}
+import os
+from datetime import datetime
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+from osgeo import gdal
+import xarray as xr
+import rioxarray as rxr
+import hvplot.xarray
+import hvplot.pandas
+import earthaccess
+import pyarrow
+import fastparquet 
+from shapely.geometry import box,mapping
+
+auth = earthaccess.login(strategy="netrc")
+
+results = earthaccess.search_data(
+    short_name = ["HLSS30_VI", "HLSL30_VI"],
+    bounding_box = (103.60, 1.15,104.10,1.48),
+    temporal = ("2025-11-01", "2025-11-30")
+)
+mpgeojson_path = "data/mpboundaries2019.geojson"
+sg_regions = gpd.read_file(mpgeojson_path)
+sg_polygon = sg_regions.dissolve()
+print(f"Search results: {len(results)}")
+
+hls_results_urls = [granule.data_links() for granule in results]
+
+gdal.SetConfigOption('GDAL_HTTP_COOKIEFILE','~/cookies.txt')
+gdal.SetConfigOption('GDAL_HTTP_COOKIEJAR', '~/cookies.txt')
+gdal.SetConfigOption('GDAL_DISABLE_READDIR_ON_OPEN','EMPTY_DIR')
+gdal.SetConfigOption('CPL_VSIL_CURL_ALLOWED_EXTENSIONS','TIF')
+gdal.SetConfigOption('GDAL_HTTP_UNSAFESSL', 'YES')
+gdal.SetConfigOption('GDAL_HTTP_MAX_RETRY', '10')
+gdal.SetConfigOption('GDAL_HTTP_RETRY_DELAY', '0.5')
+
+# I want to get NDMI and NDVI
+def return_ndmi_ndvi(url):
+    returned_urls = []
+    acronyms = ['NDVI', 'NDMI']
+    # each url returns another list of urls, so have to loop through it
+    for u in url:
+        if u[-3:] == 'tif' and u[-8:-4] in acronyms:
+            returned_urls.append(u)
+        else:
+            continue
+    if len(returned_urls) > 1:
+        return returned_urls
+    else:
+        print(f"there are no returned URLs")
+        return []
+
+def date_parser(url):
+    filename = url[0].split("/")[-1]
+    filename_parts = filename.split(".")
+    date_time_block = filename_parts[3]
+    julian_str = date_time_block[:7]
+    clean_date = datetime.strptime(julian_str, "%Y%j").strftime("%Y-%m-%d")
+    return clean_date
+    
+ndmi_ndvi_links = []
+for h in hls_results_urls:
+    ndmi_ndvi_links.append(return_ndmi_ndvi(h))
+all_dfs=[]
+master_grid_built = False
+pixel_id_df = None
+chunk_size = dict(x=512, y=512)
+# open in rasterio
+for [link1, link2] in ndmi_ndvi_links:
+    ndmi_file = [l for l in [link1, link2] if l.lower().endswith(".ndmi.tif")]
+    ndvi_file = [l for l in [link1, link2] if l.lower().endswith(".ndvi.tif")]
+    chunk_opts = dict(band=1, x=512, y=512)
+    opened_files = earthaccess.open([ndmi_file[0], ndvi_file[0]], show_progress = True)
+    print(opened_files)
+    ndmi_stream = opened_files[0]
+    ndvi_stream = opened_files[1]
+    print(ndmi_file)
+    print(ndmi_stream)
+    with (rxr.open_rasterio(ndvi_stream, chunks=chunk_opts) as ndvi_ds,rxr.open_rasterio(ndmi_stream, chunks=chunk_opts) as ndmi_ds):
+        
+        print('opening now')
+        print("\nNDVI attributes:")
+        print(ndvi_ds.attrs)
+
+        print("\nNDMI attributes:")
+        print(ndmi_ds.attrs)
+        print(
+        "NDVI raw range:",
+        float(ndvi_ds.min().compute()),
+        float(ndvi_ds.max().compute())
+        )
+
+        print(
+        "NDMI raw range:",
+        float(ndmi_ds.min().compute()),
+        float(ndmi_ds.max().compute())
+        )
+        
+
+        sg_geometry = sg_polygon.to_crs(ndvi_ds.rio.crs)
+        sg_geometry = sg_polygon.to_crs(ndvi_ds.rio.crs).geometry
+        clip_geometries = [mapping(geom) for geom in sg_geometry if geom is not None and not geom.is_empty]
+        clipped_ndvi_ds = ndvi_ds.rio.clip(clip_geometries, ndvi_ds.rio.crs, drop=True)
+        clipped_ndmi_ds = ndmi_ds.rio.clip(clip_geometries, ndmi_ds.rio.crs, drop=True)
+        
+        raster_box = box(*ndvi_ds.rio.bounds())
+
+        print(
+            "Intersects:",
+            sg_geometry.intersects(raster_box).any()
+        )
+        
+        print('just clipped the raster')
+        
+        sg_projected = sg_polygon.to_crs(ndvi_ds.rio.crs)
+        
+
+        clip_geometries = [mapping(geom) for geom in sg_projected.geometry if geom is not None and not geom.is_empty]
+        
+        clipped_ndvi_ds = ndvi_ds.rio.clip(clip_geometries, crs=sg_projected.crs, drop=True)
+        
+        clipped_ndmi_ds = ndmi_ds.rio.clip(clip_geometries, crs=sg_projected.crs, drop=True)
+
+        if not master_grid_built:
+            singapore_mask = xr.ones_like(ndvi_ds)
+
+            singapore_mask = singapore_mask.rio.clip(clip_geometries,crs=sg_projected.crs,drop=True)
+        
+            singapore_mask = singapore_mask.squeeze("band",drop=True)
+        
+            pixel_id_df = (singapore_mask.to_dataframe(name="inside_singapore").reset_index())
+        
+            pixel_id_df = pixel_id_df[pixel_id_df["inside_singapore"].notna()].copy()
+        
+            pixel_id_df = pixel_id_df[["x", "y"]].drop_duplicates()
+        
+            pixel_id_df = (pixel_id_df.sort_values(["y", "x"]).reset_index(drop=True))
+        
+            pixel_id_df["pixel_id"] = np.arange(1,len(pixel_id_df) + 1)
+            pixel_id_df = pixel_id_df[["pixel_id", "x", "y"]]
+        
+            master_grid_built = True
+        
+            print(f"Master grid created with {len(pixel_id_df):,} Singapore pixels")
+        
+            print(pixel_id_df.head())
+        
+        ndvi_valid_count = ((clipped_ndvi_ds != -19999).sum().compute().item())
+        
+        ndmi_valid_count = ((clipped_ndmi_ds != -19999).sum().compute().item())
+        
+        print("Valid NDVI pixels:", ndvi_valid_count)
+        print("Valid NDMI pixels:", ndmi_valid_count)
+        
+        print("Total NDVI pixels:", clipped_ndvi_ds.size)
+        print("Total NDMI pixels:", clipped_ndmi_ds.size)
+        ndvi = clipped_ndvi_ds.where(clipped_ndvi_ds != -19999) * 0.0001
+        ndmi = clipped_ndmi_ds.where(clipped_ndmi_ds != -19999) * 0.0001
+        df_ndvi = (ndvi.squeeze("band", drop=True).to_dataframe(name="NDVI").reset_index())
+        df_ndmi = (ndmi.squeeze("band", drop=True).to_dataframe(name="NDMI").reset_index())
+        
+        print("Before dropping NaNs:")
+        print("NDVI:", len(df_ndvi))
+        print("NDMI:", len(df_ndmi))
+        
+        print("\nNDVI values:")
+        print(df_ndvi[["x", "y", "NDVI"]].head())
+
+        merged_dataset = pixel_id_df.copy()
+        merged_dataset = pd.merge(merged_dataset,df_ndvi,on=["x", "y"],how="left")
+        
+        merged_dataset = pd.merge(merged_dataset,df_ndmi,on=["x", "y"],how="left")
+        
+        merged_dataset["date"] = pd.to_datetime(date_parser(ndmi_file))
+        final_cols = ["pixel_id", "x", "y", "date", "NDVI", "NDMI"]
+        all_dfs.append(merged_dataset[final_cols])
+        print(f"Processed clipped data for date: {merged_dataset['date'].iloc[0]}")
+        print("\n--- MASTER GRID CHECK ---")
+
+        print("Singapore pixels:",len(pixel_id_df))
+        
+        print("Rows this date:",len(merged_dataset))
+        
+        print("Valid NDVI:",merged_dataset["NDVI"].notna().sum())
+        
+        print("Valid NDMI:",merged_dataset["NDMI"].notna().sum())
+        
+        print("Missing pixel IDs:",merged_dataset["pixel_id"].isna().sum())
+        
+        print("Unique pixel IDs:",merged_dataset["pixel_id"].nunique())
+
+output_path = "data/processed/ndvimi_2025_nov.parquet"
+
+if all_dfs:
+    final_df = pd.concat(all_dfs, ignore_index=True)
+    print(f"\nFinal Clipped DataFrame Structure: {final_df.shape}")
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    final_df.to_parquet(output_path, engine="fastparquet")
+    print("parquet saving done")
+else:
+    print("No valid results.")
+    print(final_df.head())
+    
+```
+
+Checking only Nov 2025 file:
+
+```{r}
+library(nanoparquet)
+nov_path <- "data/processed/ndvimi_2025_nov.parquet"
+nov_df <- read_parquet(nov_path)
+```
+
+```{r}
+nov_df |>
+    group_by(date) |>
+    summarise(
+        total_pixels = n(),
+        valid_ndvi = sum(!is.na(NDVI)),
+        valid_ndmi = sum(!is.na(NDMI)),
+        .groups = "drop"
+    )
+```
+## Combine NDVI and NDVMI data from the six `.parquet` files together
+
+Have to use `duckdb` because the files are too large to load in memory as an R dataframe, and `arrow` keeps having issues with R markdown's `reticulate` 
+
+```{r}
+library(zoo)
+library(duckdb)
+
+duck_con <- dbConnect(duckdb())
+
+dbExecute(duck_con, "SET memory_limit = '8GB'")
+dbExecute(duck_con, "SET threads = 2")
+dbExecute(duck_con, "SET preserve_insertion_order = false")
+
+dir.create(
+  here("data", "duckdb_temp"),
+  showWarnings = FALSE
+)
+
+temp_path <- normalizePath(
+  here("data", "duckdb_temp")
+)
+
+dbExecute(
+  duck_con,
+  paste0(
+    "SET temp_directory = '",
+    temp_path,
+    "'"
+  )
+)
+
+dbExecute(
+  duck_con,
+  "
+  CREATE OR REPLACE VIEW nd_data AS
+  SELECT *
+  FROM read_parquet('data/processed/*.parquet')
+  "
+)
+
+dataset_view <- tbl(duck_con, "nd_data")
+
+```
+
+### Exploring the NDMI and NDVI data:
+
+Summarise mean NDMI and NDVI per month per year
+```{r}
+monthly_summary_mean <- dataset_view |>
+    mutate(
+        year = year(date),
+        month = month(date)
+    ) |>
+    group_by (year, month) |>
+    summarise(mean_ndvi = mean(NDVI, na.rm=TRUE),
+              mean_ndmi = mean(NDMI, na.rm=TRUE),
+    n_NDVI = sum(!is.na(NDVI)),
+    n_NDMI = sum(!is.na(NDMI)),
+    .groups = "drop") |>
+    arrange(year, month) |>
+    collect() |>
+    mutate(
+    month_date = make_date(year, month, 1)
+    )
+```
+
+Make some exploratory plots (mean NDMI and NDVI of Singapore--very coarse!):
+
+```{r}
+monthly_nd_long <- monthly_summary_mean |>
+  pivot_longer(
+    cols = c(mean_ndvi, mean_ndmi),
+    names_to = "index",
+    values_to = "mean_value"
+  ) |>
+  mutate(
+    index = recode(
+      index,
+      mean_NDVI = "NDVI",
+      mean_NDMI = "NDMI"
+    )
+  )
+
+ggplot(
+  monthly_nd_long,
+  aes(
+    x = month_date,
+    y = mean_value,
+    colour = index
+  )
+) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.5) +
+  labs(
+    x = "Date",
+    y = "Mean index value",
+    colour = "Index",
+    title = "Monthly Mean NDVI and NDMI in Singapore",
+    subtitle = "2021–2026"
+  ) 
+```
+
+boxplot of mean NDMI and NDVI per month for every year
+```{r}
+library(cowplot)
+
+ndvi_monthly_plot <- ggplot(data = monthly_summary_mean,
+    aes(x=factor(month),
+        y= mean_ndvi)
+) +
+    geom_boxplot() + 
+    geom_point(aes(colour=factor(year))) + 
+    labs(
+        x = "Month (2021-2026)",
+        y = "Mean NDVI",
+        title = "Monthly Mean NDVI from 2021-2026 in Singapore"
+    )
+
+ndmi_monthly_plot <- ggplot(data = monthly_summary_mean,
+    aes(x=factor(month),
+        y= mean_ndmi)
+) +
+    geom_boxplot() + 
+    geom_point(aes(colour=factor(year))) + 
+    labs(
+        x = "Month (2021-2026)",
+        y = "Mean NDMI",
+        title = "Monthly Mean NDMI from 2021-2026 in Singapore"
+    )
+
+plot_grid(ndvi_monthly_plot, ndmi_monthly_plot)
+```
+
+Now, make pixel-level monthly mean for 2021-2025, and then map it out:
+
+First, basemap of SG:
+```{r}
+sg_bounds <- st_read(here("data/mpboundaries2019.geojson"))
+
+sg_wgs84 <- st_transform(sg_bounds, crs = 32648)
+
+sg_valid <- st_make_valid(sg_wgs84)
+
+sg_outline <- st_union(sg_valid)
+
+sg_outline_utm <- st_transform(
+    sg_outline,
+    32648
+)
+
+pixel_locations <- DBI::dbGetQuery(
+    duck_con,
+    "
+    SELECT DISTINCT x, y
+    FROM read_parquet('data/processed/*.parquet')
+    "
+)
+
+pixel_locations_sf <- st_as_sf(
+    pixel_locations,
+    coords = c("x", "y"),
+    crs = 32648,
+    remove = FALSE
+)
+
+sg_pixels <- pixel_locations_sf[
+    st_intersects(
+        pixel_locations_sf,
+        sg_outline_utm,
+        sparse = FALSE
+    ),
+]
+
+sg_pixel_coords <- sg_pixels |>
+    st_drop_geometry() |>
+    select(x, y)
+```
+Moving on:
+
+```{r}
+library(purrr)
+library(DBI)
+
+pixel_mean <- map_dfr(
+  1:12,
+  function(m) {
+    message("Processing month ", m)
+    query <- sprintf(
+      "
+      SELECT
+          %d AS month,
+          x,
+          y,
+          AVG(NDVI) AS mean_ndvi,
+          AVG(NDMI) AS mean_ndmi
+      FROM read_parquet('data/processed/*.parquet')
+      WHERE month(date) = %d
+      GROUP BY x, y
+      ",
+      m, m
+    )
+    DBI::dbGetQuery(duck_con, query)
+  }
+)
+
+```
+- filter to only 2020-2025
+- group by pixel id, and then month
+- summarise mean NDMI and NDVI
+- plot!
+
+```{r}
+
+pixel_mean_plot <- ggplot() +
+  geom_sf(
+    data = sg_outline,
+    fill = "gray95",
+    colour = "black",
+    linewidth = 0.5
+  ) +
+  geom_point(
+    data = pixel_mean,
+    aes(
+      x = x,
+      y = y,
+      colour = mean_ndvi
+    ),
+    size = 0.3
+  ) +
+  facet_wrap(
+    ~ month,
+    ncol = 4,
+    labeller = labeller(
+      month = setNames(month.abb, 1:12)
+    )
+  ) +
+  coord_sf(crs = 32648) +
+  scale_colour_viridis_c() +
+  labs(
+    title = "Mean Monthly NDVI in Singapore",
+    subtitle = "Mean across 2021–2026",
+    x = NULL,
+    y = NULL,
+    colour = "Mean NDVI"
+  ) +
+  theme_minimal()
+
+pixel_mean_plot
+
+```
+
+try again with the difference now:
+
+```{r}
+
+rm(pixel_diff_2026)
+
+pixel_diff_2026 <- purrr::map_dfr(
+  1:9,
+  function(m) {
+
+    message("Processing month ", m)
+
+    query <- sprintf(
+      "
+      WITH yearly_monthly AS (
+
+          SELECT
+              year(date) AS year,
+              x,
+              y,
+              AVG(NDVI) AS yearly_ndvi,
+              AVG(NDMI) AS yearly_ndmi
+
+          FROM read_parquet('data/processed/*.parquet')
+
+          WHERE
+              year(date) BETWEEN 2020 AND 2025
+              AND month(date) = %d
+
+          GROUP BY
+              year(date),
+              x,
+              y
+      ),
+
+      baseline AS (
+
+          SELECT
+              x,
+              y,
+              AVG(yearly_ndvi) AS baseline_ndvi,
+              AVG(yearly_ndmi) AS baseline_ndmi,
+              COUNT(yearly_ndvi) AS n_years_ndvi,
+              COUNT(yearly_ndmi) AS n_years_ndmi
+
+          FROM yearly_monthly
+
+          GROUP BY x, y
+      ),
+
+      current_2026 AS (
+
+          SELECT
+              x,
+              y,
+              AVG(NDVI) AS ndvi_2026,
+              AVG(NDMI) AS ndmi_2026
+
+          FROM read_parquet('data/processed/*.parquet')
+
+          WHERE
+              year(date) = 2026
+              AND month(date) = %d
+
+          GROUP BY x, y
+      )
+
+      SELECT
+          %d AS month,
+          c.x,
+          c.y,
+
+          c.ndvi_2026,
+          b.baseline_ndvi,
+          c.ndvi_2026 - b.baseline_ndvi
+              AS ndvi_difference,
+
+          c.ndmi_2026,
+          b.baseline_ndmi,
+          c.ndmi_2026 - b.baseline_ndmi
+              AS ndmi_difference,
+
+          b.n_years_ndvi,
+          b.n_years_ndmi
+
+      FROM current_2026 c
+
+      LEFT JOIN baseline b
+          ON c.x = b.x
+          AND c.y = b.y
+      ",
+      m, m, m
+    )
+
+    DBI::dbGetQuery(duck_con, query)
+  }
+)
+
+pixel_diff_2026_sg <- pixel_diff_2026 |>
+  semi_join(
+    sg_pixel_coords,
+    by = c("x", "y")
+  )
+
+baseline_coverage <- pixel_diff_2026_sg |>
+  count(month, n_years_ndvi) |>
+  group_by(month) |>
+  mutate(
+    percent = 100 * n / sum(n)
+  )
+
+baseline_coverage
+
+pixel_diff_2026_sg |>
+  summarise(
+    total = n(),
+    valid_2026 = sum(!is.na(ndvi_2026)),
+    valid_baseline = sum(!is.na(baseline_ndvi)),
+    valid_difference = sum(!is.na(ndvi_difference)),
+    .by = month
+  )
+```
+
+```{r}
+baseline_quality <- pixel_diff_2026_sg |>
+  filter(!is.na(ndvi_difference)) |>
+  count(month, n_years_ndvi) |>
+  group_by(month) |>
+  mutate(
+    percent = 100 * n / sum(n)
+  )
+
+baseline_quality
+```
+
+```{r}
+pixel_diff_2026_map <- pixel_diff_2026_sg |>
+  filter(
+    !is.na(ndvi_difference),
+    n_years_ndvi >= 3
+  )
+
+pixel_diff_2026_map_ndmi <- pixel_diff_2026_sg |>
+  filter(
+    !is.na(ndmi_difference),
+    n_years_ndmi >= 3
+  )
+```
+
+Let's plot it out!
+
+```{r}
+ggplot() +
+  geom_sf(
+    data = sg_outline_utm,
+    fill = "grey90",
+    colour = "black",
+    linewidth = 0.3
+  ) +
+  geom_point(
+    data = pixel_diff_2026_map,
+    aes(
+      x = x,
+      y = y,
+      colour = ndvi_difference
+    ),
+    size = 0.1
+  ) +
+  facet_wrap(
+    ~ month,
+    ncol = 4,
+    labeller = labeller(
+      month = setNames(month.abb, 1:12)
+    )
+  ) +
+  coord_sf(crs = 32648) +
+  scale_colour_gradient2(
+    low = "brown",
+    mid = "white",
+    high = "darkgreen",
+    midpoint = 0
+  ) +
+  labs(
+    title = "2026 NDVI Anomaly",
+    subtitle = "Difference from 2021–2025 monthly baseline (≥3 historical years)",
+    x = NULL,
+    y = NULL,
+    colour = "NDVI\ndifference"
+  ) +
+  theme_minimal()
+```
+
+NDMI:
+
+```{r}
+ggplot() +
+  geom_sf(
+    data = sg_outline_utm,
+    fill = "grey90",
+    colour = "black",
+    linewidth = 0.3
+  ) +
+  geom_point(
+    data = pixel_diff_2026_map,
+    aes(
+      x = x,
+      y = y,
+      colour = ndmi_difference
+    ),
+    size = 0.05
+  ) +
+  facet_wrap(
+    ~ month,
+    ncol = 4,
+    labeller = labeller(
+      month = setNames(month.abb, 1:12)
+    )
+  ) +
+  coord_sf(crs = 32648) +
+  scale_colour_gradient2(
+    low = "brown",
+    mid = "white",
+    high = "darkgreen",
+    midpoint = 0
+  ) +
+  labs(
+    title = "2026 NDMI Anomaly",
+    subtitle = "Difference from 2021–2025 monthly baseline (≥3 historical years)",
+    x = NULL,
+    y = NULL,
+    colour = "NDMI\ndifference"
+  ) +
+  theme_minimal()
+```
+
+
+Exploratory climate data using monthly data from data.gov
+```{r}
+library(readr)
+library(stringr)
+library(lubridate)
+climate_df <- read_csv("data/monthlyclimate.csv", col_names=TRUE)
+# extract just the max daily temp
+max_daily_temp <- climate_df |>
+    filter(DataSeries == "Air Temperature Means Daily Maximum") |>
+    pivot_longer(cols = -DataSeries,
+                 names_to = "Month",
+                 values_to = "Value",
+                 values_transform = list(Value = as.character)) |>
+    select(-DataSeries) |>
+    filter(str_detect(Month, "2026") | Month %in% c("2025Nov", "2025Dec")) |>
+    mutate(
+        Value = as.numeric(Value),
+        Month = as.Date(zoo::as.yearmon(Month, format = "%Y%b")),
+    )
+
+max_temp_ts <- read.zoo(max_daily_temp, index.column="Month")
+
+total_rainfall_df <- climate_df |>
+    filter(DataSeries == "Total Rainfall") |>
+    pivot_longer(cols = -DataSeries,
+                 names_to = "Month",
+                 values_to = "Value",
+                 values_transform = list(Value = as.character)) |>
+    select(-DataSeries) |>
+    filter(str_detect(Month, "2026") | Month %in% c("2025Nov", "2025Dec")) |>
+    mutate(
+        Value = as.numeric(Value),
+        Month = as.Date(zoo::as.yearmon(Month, format = "%Y%b")),
+    )
+
+total_rainfall_ts <- read.zoo(total_rainfall_df, index.column="Month")
+
+
+```
+
+# Rainfall / Precipitation and Temperature Data
+
+Checking my old data so I don't have to grab everything again:
+
+```{r}
+old_precip_df <- read_csv("/Users/intan/Library/CloudStorage/Dropbox/NUS/GIS_gradcert/ge5228/project/sg_rainfall_historical.csv")
+str(old_precip_df)
+range.Date(old_precip_df$date)
+```
+
+## Rainfall API
+Downloading from 31 March 2026 to 30 September 2026
+```{python}
+import datetime
+import requests
+import json
+import os
+import time
+import csv
+
+
+
+API_KEY = os.getenv("DATAGOV_API")
+
+# ── Configuration ──────────────────────────────────────────────────────────────
+START_DATE    = datetime.date(2026, 3, 21)
+END_DATE      = datetime.date(2026, 9, 30)
+RAW_DIR       = "data/precip_raw"
+OUTPUT_CSV    = "data/precip.csv"
+BASE_URL      = "https://api-open.data.gov.sg/v2/real-time/api/rainfall"
+RATE_LIMIT    = 20    # page requests before sleeping
+SLEEP_SECONDS = 12    # seconds to sleep when rate limited
+PAGE_DELAY    = 0.6   # seconds between every page request
+
+FIELDNAMES = [
+    "date", "timestamp", "update_timestamp",
+    "station_id", "station_name", "station_device_id",
+    "location_longitude", "location_latitude",
+    "reading_update_timestamp", "reading_value",
+    "reading_type", "reading_unit",
+]
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def build_date_list():
+    dates = []
+    current = START_DATE
+    while current <= END_DATE:
+        dates.append(current)
+        current += datetime.timedelta(days=1)
+    return dates
+
+
+# ── Phase 1: Download ──────────────────────────────────────────────────────────
+
+def download_all():
+    os.makedirs(RAW_DIR, exist_ok=True)
+    headers = {"X-Api-Key": API_KEY} if API_KEY else {}
+
+    all_dates = build_date_list()
+    pending = [
+        d for d in all_dates
+        if not os.path.exists(os.path.join(RAW_DIR, f"{d.strftime('%Y-%m-%d')}.json"))
+    ]
+
+    total = len(pending)
+    print(f"Already downloaded : {len(all_dates) - total}")
+    print(f"Still to download  : {total}")
+
+    api_count = 0
+
+    for i, date in enumerate(pending):
+        date_str = date.strftime("%Y-%m-%d")
+        filepath = os.path.join(RAW_DIR, f"{date_str}.json")
+
+        print(f"[{i+1}/{total}] {date_str} ...", flush=True)
+
+        all_readings = []
+        url = f"{BASE_URL}?date={date_str}"
+        stations = reading_type = reading_unit = None
+        day_ok = True
+
+        while url:
+            if api_count >= RATE_LIMIT:
+                print(f"  [rate limit] sleeping {SLEEP_SECONDS}s ...")
+                time.sleep(SLEEP_SECONDS)
+                api_count = 0
+
+            time.sleep(PAGE_DELAY)
+            try:
+                r = requests.get(url, headers=headers, timeout=30)
+                api_count += 1
+            except Exception as e:
+                print(f"  request error: {e} – skipping day")
+                day_ok = False
+                break
+
+            resp = r.json()
+
+            if resp.get("data") is None:
+                print(f"  unexpected rate limit, sleeping {SLEEP_SECONDS}s ...")
+                time.sleep(SLEEP_SECONDS)
+                api_count = 0
+                continue
+
+            data = resp["data"]
+
+            if stations is None:
+                stations     = data.get("stations", [])
+                reading_type = data.get("readingType", "")
+                reading_unit = data.get("readingUnit", "")
+
+            all_readings.extend(data.get("readings", []))
+
+            token = data.get("paginationToken")
+            url   = f"{BASE_URL}?date={date_str}&paginationToken={token}" if token else None
+
+        if day_ok:
+            with open(filepath, "w") as f:
+                json.dump({
+                    "stations":    stations,
+                    "readings":    all_readings,
+                    "readingType": reading_type,
+                    "readingUnit": reading_unit,
+                }, f)
+            print(f"  saved {len(all_readings)} readings")
+
+
+# ── Phase 2: Process ───────────────────────────────────────────────────────────
+
+def process_all():
+    rows    = []
+    missing = []
+
+    for date in build_date_list():
+        date_str = date.strftime("%Y-%m-%d")
+        filepath = os.path.join(RAW_DIR, f"{date_str}.json")
+
+        if not os.path.exists(filepath):
+            missing.append(date_str)
+            continue
+
+        with open(filepath, "r") as f:
+            try:
+                day = json.load(f)
+            except Exception as e:
+                print(f"Parse error {filepath}: {e}")
+                continue
+
+        station_info = {
+            s["id"]: {
+                "name":      s.get("name", ""),
+                "device_id": s.get("deviceId", s["id"]),
+                "longitude": s.get("location", {}).get("longitude", ""),
+                "latitude":  s.get("location", {}).get("latitude",  ""),
+            }
+            for s in day.get("stations", [])
+        }
+
+        reading_type = day.get("readingType", "")
+        reading_unit = day.get("readingUnit", "")
+
+        for reading in day.get("readings", []):
+            timestamp = reading.get("timestamp", "")
+
+            for entry in reading.get("data", []):
+                sid  = entry.get("stationId", "")
+                info = station_info.get(sid, {})
+
+                rows.append({
+                    "date":                     date_str,
+                    "timestamp":                timestamp,
+                    "update_timestamp":         timestamp,
+                    "station_id":               sid,
+                    "station_name":             info.get("name", ""),
+                    "station_device_id":        info.get("device_id", sid),
+                    "location_longitude":       info.get("longitude", ""),
+                    "location_latitude":        info.get("latitude",  ""),
+                    "reading_update_timestamp": timestamp,
+                    "reading_value":            entry.get("value", ""),
+                    "reading_type":             reading_type,
+                    "reading_unit":             reading_unit,
+                })
+
+    with open(OUTPUT_CSV, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"\nWrote {len(rows):,} rows to {OUTPUT_CSV}")
+    if missing:
+        print(f"Missing data for {len(missing)} date(s): {missing[:10]}"
+              + (" ..." if len(missing) > 10 else ""))
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("Phase 1 – Downloading raw rainfall data")
+    print("=" * 60)
+    download_all()
+
+    print()
+    print("=" * 60)
+    print("Phase 2 – Processing into CSV")
+    print("=" * 60)
+    process_all()
+
+```
+
+## Air Temperature
+
+Downloading from 1 Jan 2025 to 30 Sep 2026. Downloading historical CSV for 2021 to 2024 from data.gov (much faster as the download doesn't get throttled)
+
+```{python}
+import datetime
+import requests
+import json
+import os
+import time
+import csv
+
+
+API_KEY = os.getenv("DATAGOV_API")
+
+# ── Configuration ──────────────────────────────────────────────────────────────
+START_DATE    = datetime.date(2025, 11, 1)
+END_DATE      = datetime.date(2026, 9, 30)
+RAW_DIR       = "data/temp_raw"
+OUTPUT_CSV    = "data/temp.csv"
+BASE_URL      = "https://api-open.data.gov.sg/v2/real-time/api/air-temperature"
+RATE_LIMIT    = 20    # page requests before sleeping
+SLEEP_SECONDS = 12    # seconds to sleep when rate limited
+PAGE_DELAY    = 0.6   # seconds between every page request
+
+FIELDNAMES = [
+    "date", "timestamp", "update_timestamp",
+    "station_id", "station_name", "station_device_id",
+    "location_longitude", "location_latitude",
+    "reading_update_timestamp", "reading_value",
+    "reading_type", "reading_unit",
+]
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def build_date_list():
+    dates = []
+    current = START_DATE
+    while current <= END_DATE:
+        dates.append(current)
+        current += datetime.timedelta(days=1)
+    return dates
+
+
+# ── Phase 1: Download ──────────────────────────────────────────────────────────
+
+def download_all():
+    os.makedirs(RAW_DIR, exist_ok=True)
+    headers = {"X-Api-Key": API_KEY} if API_KEY else {}
+
+    all_dates = build_date_list()
+    pending = [
+        d for d in all_dates
+        if not os.path.exists(os.path.join(RAW_DIR, f"{d.strftime('%Y-%m-%d')}.json"))
+    ]
+
+    total = len(pending)
+    print(f"Already downloaded : {len(all_dates) - total}")
+    print(f"Still to download  : {total}")
+
+    api_count = 0
+
+    for i, date in enumerate(pending):
+        date_str = date.strftime("%Y-%m-%d")
+        filepath = os.path.join(RAW_DIR, f"{date_str}.json")
+
+        print(f"[{i+1}/{total}] {date_str} ...", flush=True)
+
+        all_readings = []
+        url = f"{BASE_URL}?date={date_str}"
+        stations = reading_type = reading_unit = None
+        day_ok = True
+
+        while url:
+            if api_count >= RATE_LIMIT:
+                print(f"  [rate limit] sleeping {SLEEP_SECONDS}s ...")
+                time.sleep(SLEEP_SECONDS)
+                api_count = 0
+
+            time.sleep(PAGE_DELAY)
+            try:
+                r = requests.get(url, headers=headers, timeout=30)
+                api_count += 1
+            except Exception as e:
+                print(f"  request error: {e} – skipping day")
+                day_ok = False
+                break
+
+            resp = r.json()
+
+            if resp.get("data") is None:
+                print(f"  unexpected rate limit, sleeping {SLEEP_SECONDS}s ...")
+                time.sleep(SLEEP_SECONDS)
+                api_count = 0
+                continue
+
+            data = resp["data"]
+
+            if stations is None:
+                stations     = data.get("stations", [])
+                reading_type = data.get("readingType", "")
+                reading_unit = data.get("readingUnit", "")
+
+            all_readings.extend(data.get("readings", []))
+
+            token = data.get("paginationToken")
+            url   = f"{BASE_URL}?date={date_str}&paginationToken={token}" if token else None
+
+        if day_ok:
+            with open(filepath, "w") as f:
+                json.dump({
+                    "stations":    stations,
+                    "readings":    all_readings,
+                    "readingType": reading_type,
+                    "readingUnit": reading_unit,
+                }, f)
+            print(f"  saved {len(all_readings)} readings")
+
+
+# ── Phase 2: Process ───────────────────────────────────────────────────────────
+
+def process_all():
+    rows    = []
+    missing = []
+
+    for date in build_date_list():
+        date_str = date.strftime("%Y-%m-%d")
+        filepath = os.path.join(RAW_DIR, f"{date_str}.json")
+
+        if not os.path.exists(filepath):
+            missing.append(date_str)
+            continue
+
+        with open(filepath, "r") as f:
+            try:
+                day = json.load(f)
+            except Exception as e:
+                print(f"Parse error {filepath}: {e}")
+                continue
+
+        station_info = {
+            s["id"]: {
+                "name":      s.get("name", ""),
+                "device_id": s.get("deviceId", s["id"]),
+                "longitude": s.get("location", {}).get("longitude", ""),
+                "latitude":  s.get("location", {}).get("latitude",  ""),
+            }
+            for s in day.get("stations", [])
+        }
+
+        reading_type = day.get("readingType", "")
+        reading_unit = day.get("readingUnit", "")
+
+        for reading in day.get("readings", []):
+            timestamp = reading.get("timestamp", "")
+
+            for entry in reading.get("data", []):
+                sid  = entry.get("stationId", "")
+                info = station_info.get(sid, {})
+
+                rows.append({
+                    "date":                     date_str,
+                    "timestamp":                timestamp,
+                    "update_timestamp":         timestamp,
+                    "station_id":               sid,
+                    "station_name":             info.get("name", ""),
+                    "station_device_id":        info.get("device_id", sid),
+                    "location_longitude":       info.get("longitude", ""),
+                    "location_latitude":        info.get("latitude",  ""),
+                    "reading_update_timestamp": timestamp,
+                    "reading_value":            entry.get("value", ""),
+                    "reading_type":             reading_type,
+                    "reading_unit":             reading_unit,
+                })
+
+    with open(OUTPUT_CSV, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"\nWrote {len(rows):,} rows to {OUTPUT_CSV}")
+    if missing:
+        print(f"Missing data for {len(missing)} date(s): {missing[:10]}"
+              + (" ..." if len(missing) > 10 else ""))
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("Phase 1 – Downloading raw air temp data")
+    print("=" * 60)
+    download_all()
+
+    print()
+    print("=" * 60)
+    print("Phase 2 – Processing into CSV")
+    print("=" * 60)
+    process_all()
+
+```
+
+## Climate data processing
+
+Processing raw 2026 precip data and combining it with the older precip csv
+
+Old precip data is missing station id, let's try to join from 2026 data
+
+```{r}
+station_df <- precip2026_df |>
+    distinct(station_id, .keep_all = TRUE) |>
+    select(station_id, station_name, location_longitude, location_latitude)
+
+# join the old precip data 
+
+precipold_df_updated <- precipold_df |>
+    left_join(station_df, by = c("location_longitude", "location_latitude"))
+
+```
+
+Unfortunately there are still NAs in the station id. Moving forward, group by `location_longitude` and `location_latitude`.
+
+Average the reading per station per month
+
+remember to drop 2016 to 2020! 
+
+```{r}
+precip2026_df <- read_csv(here("data/precip2026_marchonwards.csv"))
+precipold_df <- read_csv(here("data/precip-all.csv"))
+
+precip_df <- bind_rows(precipold_df_updated, precip2026_df) |>
+    select(-c("station_device_id", "reading_update_timestamp", "reading_type", "reading_unit", "station_name")) |>
+    mutate(station_id = as.factor(station_id))
+```
+
+Monthly mean?
+
+```{r}
+
+precip_df <- precip_df |>
+    filter(date > "2020-12-31")
+
+precip_monthly_mean <- precip_df |>
+    group_by(year = year(date),
+           month = month(date),
+           station_id, location_longitude, location_latitude) |>
+    summarise(mean_monthly = mean(reading_value, na.rm=TRUE),
+              total_readings = n(),
+              total_monthly = sum(reading_value, na.rm=TRUE),
+    .groups = "drop")
+```
+
+
+### Exploratory plotting of the precipitation data
+
+Where are all these stations, anyway!
+
+```{r} 
+library(sf)
+
+sg_bounds <- st_read(here("data/mpboundaries2019.geojson"))
+
+sg_wgs84 <- st_transform(sg_bounds, crs = 4326)
+
+sg_valid <- st_make_valid(sg_wgs84)
+
+sg_outline <- st_union(sg_valid)
+
+ggplot()+ 
+    geom_sf(data = sg_outline, fill = "gray95", color = "black", linewidth = 0.5) + 
+    geom_point(data = precip_df, 
+    aes(x = location_longitude, y = location_latitude, colour = station_id),
+    size = 2) + 
+    theme(legend.position = "none")
+
+```
+
+What is the monthly mean of rainfall across singapore?
+
+- Group by month
+
+```{r}
+precip_monthly_mean_v2 <- precip_df |>
+    group_by(year = year(date),
+           month = month(date)) |>
+    summarise(mean_monthly = mean(reading_value, na.rm=TRUE),
+              total_readings = n(),
+              total_monthly = sum(reading_value, na.rm=TRUE),
+    .groups = "drop")
+
+precip_monthly_plot <- ggplot(data = precip_monthly_mean_v2,
+    aes(x=factor(month),
+        y= mean_monthly,
+        group = factor(month))
+) +
+    geom_boxplot() + 
+    geom_point(aes(colour=factor(year))) + 
+    labs(
+        x = "Months (2021-2026)",
+        y = "Mean rainfall (mm)",
+        colour = "Year",
+        title = "Monthly Mean Rainfall from 2021-2026 in Singapore"
+    )
+
+```
+
+### Exploratory plotting for temp
+
+Processing the temperature data the same way:
+
+Get the `temp_df`:
+```{r}
+file_paths <- list.files(path = here("data"), 
+                         pattern = "temp202.*\\.csv$", 
+                         full.names = TRUE)
+
+temp_df <- read_csv(file_paths, id = "file_source")
+```
+
+Clean up a little:
+```{r}
+temp_df <- temp_df |> 
+    select(-c("file_source", "update_timestamp", "reading_update_timestamp", "reading_type", "station_device_id", "reading_unit")) |>
+    mutate(across(c("station_id", "station_name"), as.factor))
+```
+
+Average it out and plot it out:
+```{r}
+temp_monthly_mean <- temp_df |>
+    group_by(year = year(date),
+           month = month(date)) |>
+    summarise(mean_monthly = mean(reading_value, na.rm=TRUE),
+              total_readings = n(),
+    .groups = "drop")
+
+ggplot(data = temp_monthly_mean, 
+       aes(x=factor(month),
+        y= mean_monthly,
+        group = factor(month))) +
+    geom_boxplot() +
+    geom_point(aes(colour=factor(year))) +
+    labs(
+        x = "Months (2021-2026)",
+        y = "Mean Air Temperature (deg C)",
+        colour = "Year",
+        title = "Monthly Mean Air Temperature from 2021-2026 in Singapore"
+    )
+```
+
+plot out temp weather stations:
+
+```{r} 
+library(sf)
+
+sg_bounds <- st_read(here("data/mpboundaries2019.geojson"))
+
+sg_wgs84 <- st_transform(sg_bounds, crs = 4326)
+
+sg_valid <- st_make_valid(sg_wgs84)
+
+sg_outline <- st_union(sg_valid)
+
+ggplot()+ 
+    geom_sf(data = sg_outline, fill = "gray95", color = "black", linewidth = 0.5) + 
+    geom_point(data = temp_df, 
+    aes(x = location_longitude, y = location_latitude, colour = station_id),
+    size = 2) + 
+    theme(legend.position = "none")
+
+```
+
+# Finale 
+
+Don't forget to disconnect duckDB (only run this chunk after all duckDB queries are finished!)
+
+```{r}
+dbDisconnect(duck_con, shutdown = TRUE)
+```
+
