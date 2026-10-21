@@ -601,13 +601,13 @@ precip_df <- precip_df |>
 
 precip_daily <- precip_df |>
     filter(!is.na(station_id)) |>
-    group_by(station_id,date,)|>
+    group_by(station_id,date,location_longitude, location_latitude)|>
     summarise(daily_sum = sum(reading_value, na.rm = TRUE),
               n_readings = sum(!is.na(reading_value)),
               .groups = "drop")
 
 precip_monthly <- precip_daily |>
-    group_by(station_id, year = lubridate::year(date),month = lubridate::month(date))|>
+    group_by(station_id,location_longitude, location_latitude, year = lubridate::year(date),month = lubridate::month(date))|>
     summarise(mean_monthly_daily_sum = mean(daily_sum, na.rm = TRUE),
               cumulative_monthly = sum(daily_sum, na.rm = TRUE),
               valid_days = sum(n_readings > 0),
@@ -618,19 +618,6 @@ station_location <- precip_df |>
     filter(!is.na(station_id), !is.na(location_latitude), !is.na(location_longitude))|>
     group_by(station_id, location_longitude, location_latitude) |>
     summarise(first_date = min(date), last_date = max(date), .groups="drop")
-
-station_location_canon <- station_location |>
-    group_by(station_id) |>
-    slice_min(order_by = first_date, n =1, with_ties = FALSE) |>
-    ungroup() |> 
-    select(-c("first_date", "last_date"))
-
-precip_monthly_spatial <- precip_monthly |>
-    left_join(station_location_canon, by = "station_id", relationship = "many-to-one")
-
-stations <- station_location_canon |>
-    arrange(station_id) |>
-    mutate(station_code = row_number())
     
 ```
 
@@ -669,76 +656,64 @@ names(nearest_station) <- "station_code"
 terra::writeRaster(nearest_station, "data/geotiff/template/precip_stations.tif", overwrite=TRUE)
 ```
 
-join precip_monthly with stations_df:
-```{r}
-precip_monthly <- precip_monthly |>
-              left_join(stations |> select("station_code", "location_latitude", "location_longitude", "station_id"), by = "station_id", relationship = "many-to-one") |>
-    filter(!is.na(location_longitude),
-           !is.na(location_latitude),
-           !is.na(station_code))
-```
-
 create the monthly precip rasters:
 
 ```{r}
 create_monthly_precip_rasters <- function(
     precip_monthly,
     template_output_path,
-    nearest_station_path,
     years = 2020:2026,
-    months = 1:12){
+    months = 1:12,
+    min_valid_days = 24){
   template <- terra::rast(template_output_path)
-  nearest_station <-terra::rast(nearest_station_path)
-  # check if nearest station path geom matches template geom 
-  if (!terra::compareGeom(template,nearest_station,stopOnError=FALSE)){
-      stop("Nearest-station raster does not match template.")
-  }
+  bnd <- terra::as.polygons(terra::ext(template), crs=terra::crs(template))
+  vars <- c("mean_monthly_daily_sum", "cumulative_monthly", "valid_days", "rainy_days")
   
   for (yr in years) {
-      message("Checking year", yr)
-      precip_year <- precip_monthly|>
-          filter(year == yr)
-      
       for (mo in months){
-          message("Checking month", mo)
-          precip_month <- precip_year |>
-              filter(month == mo)
+          message("Processing ", yr, " - ", mo)
+          precip_month <- precip_monthly|>
+              filter(year == yr, month == mo, valid_days >= min_valid_days)
           if (nrow(precip_month) == 0){
               message("No data for this month. Skipping.")
               next
           }
-          precip_month <- precip_month |>
-              select(station_code, mean_monthly_daily_sum, cumulative_monthly, valid_days, rainy_days)
-          layers <- lapply(c("mean_monthly_daily_sum", "cumulative_monthly", "valid_days", "rainy_days"), function(var){
-              lookup <-precip_month |> select(station_code, all_of(var))
-              rainfall <- terra::subst(nearest_station, from = lookup$station_code, to =lookup[[var]], others = NA)
-              names(rainfall) <- var
-              return(rainfall)
+          pts <- terra::vect(precip_month, 
+          geom = c("location_longitude", "location_latitude"),
+          crs = "EPSG:4326") |>
+            terra::project(terra::crs(template))
+          month_voronoi <- terra::voronoi(pts, bnd = bnd)
+          month_voronoi <- terra::crop(month_voronoi, bnd)
+          
+          layers <- lapply(vars, function(var){
+            terra::rasterize(month_voronoi, template, field = var)
           })
-          monthly_raster <- do.call(c, layers)
-          monthly_raster <- terra::mask(monthly_raster,template)
-          output_dir <- here("data","geotiff","climate","precip","individual_years",as.character(yr))
+          monthly_raster <- terra::mask(terra::rast(layers), template)
+          names(monthly_raster) <- vars
+
+          output_dir <- here("data","geotiff","climate_v2","precip","individual_years",as.character(yr))
           dir.create(output_dir,recursive = TRUE,showWarnings = FALSE)
           output_file <- file.path(output_dir,sprintf("precip_station_monthly_%d_%02d.tif",yr,mo))
           terra::writeRaster(monthly_raster,output_file,overwrite = TRUE,wopt = list(gdal = c("COMPRESS=DEFLATE","TILED=YES")))
           message(output_file, " done.")
-          rm(monthly_raster, layers)
+          rm(monthly_raster, layers, month_voronoi, pts)
           gc()
       }
   }
     invisible(NULL)
 }
 ```
+
 call the function:
 ```{r}
 template_output_path = "data/geotiff/template/hls_singapore_template.tif"
 nearest_station_path = "data/geotiff/template/precip_stations.tif"
-create_monthly_precip_rasters(precip_monthly, template_output_path, nearest_station_path)
+create_monthly_precip_rasters(precip_monthly, template_output_path)
 ```
 
 QC:
 ```{r}
-test_2026_apr <- rast("data/geotiff/climate/precip/individual_years/2026/precip_station_monthly_2026_01.tif")
+test_2026_apr <- rast("data/geotiff/climate_v2/precip/individual_years/2026/precip_station_monthly_2026_01.tif")
 plot(test_2026_apr)
 
 ```
@@ -771,27 +746,117 @@ file_paths <- list.files(path = here("data"),
 temp_df <- read_csv(file_paths, id = "file_source") |>
     select(-c("update_timestamp", "station_device_id", "reading_update_timestamp", "reading_type", "reading_unit"))|>
     mutate(station_id = as.factor(station_id)) |>
-    filter(date > "2020-09-30")
+    filter(date > "2020-09-30") |>
+    drop_na()
 
 ```
 
-For temp data, we're interested in monthly means of the following for each station:
+The reading is taken every 1 minute. 
 
-## Extend the data to the gaps
+There are 38 station IDs and 67 station names, some of which are called by their station id names. Let's just categorize by lon and lat again to make things easier.
 
-For every month of every year. 
+Interesting data to derive from this is the mean monthly daily mean, mean monthly daily max, mean monthly daily low and max daily max and min daily min so let's do that:
 
-Write function that is going to be applied to every pixel. Loop through the unique list of weather stations for precip and temp. Find the closest one. Assign the data in them. 
+```{r}
+daily_temp_df <- temp_df |>
+    group_by(station_name, location_longitude, location_latitude, year = lubridate::year(date), month = lubridate::month(date), day = lubridate::day(date)) |>
+    summarise(
+        daily_max = max(reading_value),
+        daily_min = min(reading_value),
+        daily_mean = mean(reading_value),
+        n_readings = sum(!is.na(reading_value)),
+        .groups = "drop"
+    )
 
-Save the raster file. 
+monthly_temp_df <- daily_temp_df |>
+    group_by(station_name, location_longitude, location_latitude, year, month) |>
+    summarise(
+        mean_monthly_mean = mean(daily_mean),
+        mean_monthly_max = mean(daily_max),
+        mean_monthly_min = mean(daily_min),
+        max_monthly_max = max(daily_max),
+        min_monthly_min = min(daily_min),
+        valid_days = sum(n_readings > 0),
+        .groups = "drop"
+    )
 
-Directory: 
-`data/geotiff/weather/individual_years/precip/`
-`data/geotiff/weather/individual_years/temp/`
+```
+
+Let's make the function that will create the voronoi for the temp data:
+
+```{r}
+create_monthly_temp_rasters <- function(
+    monthly_temp_df,
+    template_output_path,
+    years = 2020:2026,
+    months = 1:12,
+    min_valid_days = 24){
+  template <- terra::rast(template_output_path)
+  bnd <- terra::as.polygons(terra::ext(template), crs=terra::crs(template))
+  vars <- c("mean_monthly_mean", "mean_monthly_max", "mean_monthly_min", "max_monthly_max", "min_monthly_min", "valid_days")
+  
+  for (yr in years) {
+      for (mo in months){
+          message("Processing ", yr, " - ", mo)
+          temp_month <- monthly_temp_df|>
+              filter(year == yr, month == mo, valid_days >= min_valid_days)
+          if (nrow(temp_month) == 0){
+              message("No data for this month. Skipping.")
+              next
+          }
+          pts <- terra::vect(temp_month, 
+          geom = c("location_longitude", "location_latitude"),
+          crs = "EPSG:4326") |>
+            terra::project(terra::crs(template))
+          month_voronoi <- terra::voronoi(pts, bnd = bnd)
+          month_voronoi <- terra::crop(month_voronoi, bnd)
+          
+          layers <- lapply(vars, function(var){
+            terra::rasterize(month_voronoi, template, field = var)
+          })
+          monthly_raster <- terra::mask(terra::rast(layers), template)
+          names(monthly_raster) <- vars
+
+          output_dir <- here("data","geotiff","climate_v2","temp","individual_years",as.character(yr))
+          dir.create(output_dir,recursive = TRUE,showWarnings = FALSE)
+          output_file <- file.path(output_dir,sprintf("temp_station_monthly_%d_%02d.tif",yr,mo))
+          terra::writeRaster(monthly_raster,output_file,overwrite = TRUE,wopt = list(gdal = c("COMPRESS=DEFLATE","TILED=YES")))
+          message(output_file, " done.")
+          rm(monthly_raster, layers, month_voronoi, pts)
+          gc()
+      }
+  }
+    invisible(NULL)
+}
+```
+
+and call the function:
+
+```{r}
+template_output_path = "data/geotiff/template/hls_singapore_template.tif"
+create_monthly_temp_rasters(monthly_temp_df, template_output_path)
+```
+
+and some QCs:
+
+```{r}
+test_2026_july <- rast("data/geotiff/climate_v2/temp/individual_years/2026/temp_station_monthly_2026_07.tif")
+plot(test_2026_july)
+
+```
 
 # Step 5: precip and airtemp difference for 2026 and 2025 Oct - Dec
 
 ## Find average 
+
+Load the rasters
+
+#### Precipitation
+
+```{r}
+
+```
+
 
 Directory: 
 `data/geotiff/weather/average`
