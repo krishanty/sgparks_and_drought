@@ -707,8 +707,7 @@ create_monthly_precip_rasters <- function(
 call the function:
 ```{r}
 template_output_path = "data/geotiff/template/hls_singapore_template.tif"
-nearest_station_path = "data/geotiff/template/precip_stations.tif"
-create_monthly_precip_rasters(precip_monthly, template_output_path)
+create_monthly_precip_rasters(precip_monthly, template_output_path, min_valid_days = 0)
 ```
 
 QC:
@@ -834,7 +833,7 @@ and call the function:
 
 ```{r}
 template_output_path = "data/geotiff/template/hls_singapore_template.tif"
-create_monthly_temp_rasters(monthly_temp_df, template_output_path)
+create_monthly_temp_rasters(monthly_temp_df, template_output_path, min_valid_days = 0)
 ```
 
 and some QCs:
@@ -847,28 +846,114 @@ plot(test_2026_july)
 
 # Step 5: precip and airtemp difference for 2026 and 2025 Oct - Dec
 
-## Find average 
+Let's make a function that takes the following arguments:
+- temp or precip directory
+- min year (2020) and max years (2025)
+- calculate the max month-year from the min year (ie october 2025)
+- year of interest (2026)
 
-Load the rasters
+and then open the list of raster of files, we can find the month because of the file name. take the mean.
 
-#### Precipitation
+separately open 2026 of that month and then just take the difference.
 
-```{r}
+save as a separate raster file. 
 
 ```
+file_paths <- list.files(
+  path = "path/to/parent_directory", 
+  pattern = "\\_07.tif$", 
+  full.names = TRUE, 
+  recursive = TRUE
+)
+```
 
+making some helper functions first, namely to find min month and to find max month
+```{r}
+months_range <- function(min_year_dir){
+    min_year_months_paths <- list.files(min_year_dir)
+    month_strings <- str_sub(min_year_months_paths, -6, -5)
+    months_vector <- as.double(month_strings)
+    min(months_vector, na.rm=TRUE)
+}
+```
 
+```{r}
+create_diff_raster<- function(parent_dir, min_year = 2020, number_of_mean_years = 5, year_of_interest = 2026, drop_layers = c("valid_days", "rainy_days")){
+    file_paths <- list.files(
+        path = parent_dir,
+        # only the monthly station rasters, so earlier mean_difference outputs are never read back in
+        pattern = "_station_monthly_\\d{4}_\\d{2}\\.tif$",
+        full.names = TRUE,
+        recursive = TRUE
+    )
+    year_month <- str_match(file_paths, "_(\\d{4})_(\\d{2})\\.tif$")
+    file_info <- tibble(
+        path = file_paths,
+        year = as.integer(year_month[, 2]),
+        month = as.integer(year_month[, 3]),
+        date = lubridate::make_date(year, month, 1)
+    )
+    min_month <- months_range(file.path(parent_dir, min_year))
+    window_start <- lubridate::make_date(min_year, min_month, 1)
+    window_end <- window_start + lubridate::years(number_of_mean_years)
+    baseline_files <- file_info |>
+        filter(date >= window_start, date < window_end)
+    monthly_means <- lapply(1:12, function(m) {
+        month_paths <- baseline_files |> filter(month == m) |> pull(path)
+        month_stack <- terra::rast(month_paths)
+        month_stack <- month_stack[[!names(month_stack) %in% drop_layers]]
+        terra::tapp(month_stack, index = names(month_stack), fun = mean, na.rm = TRUE)
+    })
+    names(monthly_means) <- sprintf("%02d", 1:12)
+    
+    current_files <- file_info |>
+        filter(date >= window_end)
+
+    output_dir <- file.path(parent_dir, "mean_difference")
+    dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+    for (i in seq_len(nrow(current_files))) {
+        yr <- current_files$year[i]
+        mo <- current_files$month[i]
+        current_rast <- terra::rast(current_files$path[i])
+        current_rast <- current_rast[[!names(current_rast) %in% drop_layers]]
+        diff_rast <- current_rast - monthly_means[[sprintf("%02d", mo)]]
+
+        output_file <- file.path(output_dir, sprintf("mean_difference_%d_%02d.tif", yr, mo))
+        terra::writeRaster(diff_rast, output_file, overwrite = TRUE, wopt = list(gdal = c("COMPRESS=DEFLATE", "TILED=YES")))
+        message(output_file, " done.")
+    }
+    invisible(NULL)
+}
+```
+
+Call the function:
+
+```{r}
+precip_path <- "data/geotiff/climate_v2/precip/individual_years"
+temp_path <- "data/geotiff/climate_v2/temp/individual_years"
+
+for(p in c(precip_path, temp_path)){
+    print(p)
+    create_diff_raster((p))
+}
+
+create_diff_raster(temp_path)
+```
+
+some QC:
+
+```{r}
+test_temp_2025oct<- rast("data/geotiff/climate_v2/temp/individual_years/mean_difference/mean_difference_2025_10.tif")
+plot(test_temp_2025oct)
+
+test_precip_2026july<- rast("data/geotiff/climate_v2/precip/individual_years/mean_difference/mean_difference_2026_07.tif")
+plot(test_precip_2026july)
+
+```
 Directory: 
 `data/geotiff/weather/average`
 
-Plot to check just in case
-
-## Difference for each month 
-
-Directory: 
-`data/geotiff/weather/difference`
-
-Plot to check just in case
 
 # Step 6: Land use layer 
 
@@ -1096,6 +1181,114 @@ comparison_df |>
 
 # Penultimate step: Distill into csv file if needed
 
+One csv per comparison month (Oct 2025 - Sep 2026). Each row is a land pixel of the template, and each column is a layer:
+- `precip_*`, `temp_*`: station values for that month
+- `precip_diff_*`, `temp_diff_*`: difference from the 5-year mean
+- `NDVI`, `NDMI`: HLS values for that month (water-masked)
+- `NDVI_diff`, `NDMI_diff`: difference from the 5-year mean (water-masked)
+
+If a source has no file for a month (e.g. temp for Oct 2025), its columns are left as NA so every csv has the same columns.
+
+```{r}
+read_prefixed <- function(path, prefix, keep_layers, template){
+    if (!file.exists(path)) {
+        r <- terra::rast(template, nlyrs = length(keep_layers), vals = NA)
+        names(r) <- keep_layers
+    } else {
+        r <- terra::rast(path)[[keep_layers]]
+    }
+    names(r) <- paste0(prefix, names(r))
+    r
+}
+
+create_monthly_csvs <- function(
+    template_output_path,
+    output_dir = here("data", "csv"),
+    first_month = as.Date("2025-10-01"),
+    n_months = 12,
+    drop_layers = c("valid_days", "rainy_days"),
+    lu_path = here("data", "shp", "LU.geojson")){
+  template <- terra::rast(template_output_path)
+  waterbody_vect <- read_sf(lu_path) |>
+      filter(LU_DESC == "WATERBODY") |>
+      st_transform(crs = terra::crs(template)) |>
+      terra::vect()
+  climate_base <- here("data", "geotiff", "climate_v2")
+  ndvimi_base <- here("data", "geotiff", "ndvimi")
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+  # layer names to keep from each climate source, taken from any existing file
+  climate_layers <- lapply(c(precip = "precip", temp = "temp"), function(v){
+      ref_file <- list.files(file.path(climate_base, v, "individual_years"),
+                             pattern = "_station_monthly_\\d{4}_\\d{2}\\.tif$",
+                             full.names = TRUE, recursive = TRUE)[1]
+      setdiff(names(terra::rast(ref_file)), drop_layers)
+  })
+
+  for (i in seq_len(n_months)) {
+      month_date <- seq(first_month, by = "month", length.out = n_months)[i]
+      yr <- lubridate::year(month_date)
+      mo <- lubridate::month(month_date)
+      message("Processing ", yr, " - ", mo)
+
+      layers <- list()
+      for (v in c("precip", "temp")) {
+          years_dir <- file.path(climate_base, v, "individual_years")
+          layers[[v]] <- read_prefixed(
+              file.path(years_dir, yr, sprintf("%s_station_monthly_%d_%02d.tif", v, yr, mo)),
+              paste0(v, "_"), climate_layers[[v]], template)
+          layers[[paste0(v, "_diff")]] <- read_prefixed(
+              file.path(years_dir, "mean_difference", sprintf("mean_difference_%d_%02d.tif", yr, mo)),
+              paste0(v, "_diff_"), climate_layers[[v]], template)
+      }
+      layers$ndvimi <- read_prefixed(
+          file.path(ndvimi_base, "individual_years", yr, sprintf("NDVI_NDMI_%d_%02d.tif", yr, mo)),
+          "", c("NDVI", "NDMI"), template) |>
+          terra::mask(waterbody_vect, inverse = TRUE)
+      layers$ndvimi_diff <- read_prefixed(
+          file.path(ndvimi_base, "difference_watermasked", sprintf("NDVI_NDMI_diff_%d_watermasked.tif", mo)),
+          "", c("NDVI_diff", "NDMI_diff"), template)
+
+      month_stack <- terra::mask(terra::rast(unname(layers)), template)
+      # na.rm = NA drops only cells where every layer is NA, i.e. outside the template
+      month_df <- terra::as.data.frame(month_stack, xy = TRUE, na.rm = NA)
+      lonlat <- terra::project(as.matrix(month_df[, c("x", "y")]), from = terra::crs(template), to = "EPSG:4326")
+
+      month_df <- month_df |>
+          mutate(across(-c(x, y), \(v) round(v, 4))) |>
+          mutate(lon = round(lonlat[, 1], 6), lat = round(lonlat[, 2], 6), year = yr, month = mo, .after = y)
+
+      output_file <- file.path(output_dir, sprintf("pixels_%d_%02d.csv", yr, mo))
+      readr::write_csv(month_df, output_file, na = "")
+      message(output_file, " done.")
+      rm(layers, month_stack, month_df, lonlat)
+      gc()
+  }
+  invisible(NULL)
+}
+```
+
+and call the function:
+
+```{r}
+create_monthly_csvs(template_output_path)
+```
+
+Load all the rasters for precip and turn into csv
+
+```{r}
+```
+
+
+Load all the rasters for air temp and turn into csv
+
+Load all the rasters for mean difference for precip and turn into csv
+
+Load all the rasters for mean difference for temp and turn into csv
+
+Load all the rasters for NDMI difference into CSV
+
+load all the rasters for ndvi difference and turn into csv
 # Final step: close duckDB connection
 ```{r}
 dbDisconnect(duck_con, shutdown = TRUE)
