@@ -4,6 +4,7 @@ library(lmerTest)
 library(lattice)     
 library(tidyverse)
 library(tsibble)
+library(DHARMa)
 ```
 
 parks type:
@@ -28,7 +29,7 @@ wider_data_ndvi <- parks |>
         names_from = stats,
         values_from = value) |>
     mutate(across(c(name, type, year, month), \(x)as.factor(x))) |>
-    select(name, month, year, year_month, type, mean_ndvi, cumulative_monthly_precip,mean_monthly_max_temp,mean_monthly_mean_temp) |>
+    select(name, month, year, year_month, type, mean_ndvi, cumulative_monthly_precip,mean_monthly_max_temp,mean_monthly_mean_temp, n_pixels) |>
     arrange(name, year_month) |>
     group_by(name) |>
     mutate(precip_lag1 = dplyr::lag(cumulative_monthly_precip, 1),
@@ -39,9 +40,7 @@ wider_data_ndvi <- parks |>
         mean_temp_lag2 = dplyr::lag(mean_monthly_mean_temp, 2)) |>
     filter(!is.na(mean_ndvi)) |>
     ungroup() |>
-    mutate(across(where(is.numeric) & !mean_ndvi, \(x) as.numeric(scale(x)))) |>
-    drop_na(mean_ndvi, type, cumulative_monthly_precip, mean_monthly_max_temp, precip_lag1)
-
+    mutate(across(where(is.numeric) & !mean_ndvi, \(x) as.numeric(scale(x))))
 
 wider_data_ndmi <- parks |>
     filter(variable != "ndvi")|>
@@ -50,7 +49,7 @@ wider_data_ndmi <- parks |>
         names_from = stats,
         values_from = value) |>
     mutate(across(c(name, type, year, month), \(x)as.factor(x))) |>
-    select(name, month, year, type, year_month, mean_ndmi, cumulative_monthly_precip,mean_monthly_max_temp,mean_monthly_mean_temp) |>
+    select(name, month, year, type, year_month, mean_ndmi, cumulative_monthly_precip,mean_monthly_max_temp,mean_monthly_mean_temp,n_pixels) |>
     arrange(name, year_month) |>
     group_by(name) |>
     mutate(precip_lag1 = dplyr::lag(cumulative_monthly_precip, 1),
@@ -81,9 +80,9 @@ ggplot(data=wider_data_ndmi, aes())
 use max temp for the lme:
 
 ```{r}
-ndvi_lme <- lmer(mean_ndvi ~ . - month - name -year - year_month + (1|month) + (1|name), data=wider_data_ndvi)
+ndvi_lme <- lmer(mean_ndvi ~ . - month - name -year - year_month + (1|month) + (1|name), data=ndvi_lme_data)
 
-ndmi_lme <- lmer(mean_ndmi ~ . -month - name -year - year_month + (1|month) + (1|name), data=wider_data_ndmi)
+ndmi_lme <- lmer(mean_ndmi ~ . -month - name -year - year_month + (1|month) + (1|name), data=ndmi_lme_data)
 ```
 
 checking resids:
@@ -91,8 +90,8 @@ checking resids:
 ```{r}
 plot(ndvi_lme) 
 qqnorm(resid(ndvi_lme))
-qqline(resid(ndvi_lme))             
-lattice::qqmath(ranef(ndvi_lme))                            
-acf(resid(ndvi_lme)[order(wider_data_ndvi$name, wider_data_ndvi$year_month)]) 
+qqline(resid(ndvi_lme))
+lattice::qqmath(ranef(ndvi_lme))                     
+acf(resid(ndvi_lme)[order(ndvi_lme_data$name, ndvi_lme_data$year_month)]) 
 
 ```
