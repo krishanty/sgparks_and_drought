@@ -1,0 +1,394 @@
+Load libraries
+
+```{r}
+library(tidyverse)
+library(terra)
+library(sf)
+library(here)
+library(tsibble)
+```
+
+Load the parks raster:
+```{r}
+nparks_shp <- st_read("/Users/intan/Library/CloudStorage/Dropbox/NUS/MSc/BL5233/droughtNDVI/data/shp/nparks.geojson")
+```
+
+Rasterise the parks layer (minus nature reserves, and also only keep mainland singapore)
+```{r}
+library(tidyterra)
+full_parks_vectors <- terra::project(terra::vect(nparks_shp),"epsg:32648")
+not_mainland <- c("PULAU UBIN AND CHEK JAWA", "SISTERS' ISLAND MARINE PARK")
+full_parks_vectors <- full_parks_vectors |>
+    filter(N_RESERVE==0) |>
+    filter(!NAME %in% not_mainland)
+parks_filter_raster_template <- terra::rast(full_parks_vectors, res=30)
+parks_filter_raster <- terra::rasterize(full_parks_vectors, parks_filter_raster_template)
+terra::writeRaster(parks_filter_raster, output_file,overwrite=TRUE)
+```
+
+Filter for the parks we're interested in
+```{r}
+# poi <- toupper(c("ADMIRALTY PK", "Bukit Batok Nature Park", "BUKIT BATOK TOWN PARK", "CHESTNUT NATURE PARK", "Dairy Farm Nature Park", "MOUNT FABER PARK", "RIFLE RANGE NATURE PARK", "TAMPINES ECO GREEN PK", "THOMSON NATURE PARK", "WINDSOR NATURE PARK"))
+
+poi <- c("PULAU UBIN AND CHEK JAWA", "SISTERS' ISLAND MARINE PARK", "PULAU UNUM", "BETING BRONOK", "PULAU SEKUDU")
+
+parks_filtered <- nparks_shp %>% 
+    filter(!NAME %in% poi) |>
+    filter(N_RESERVE==0)
+
+parks_vectors <- terra::vect(x = parks_filtered)
+
+lapply(poi,function(name){
+    file_name <- paste0(gsub(" ", "_", name), ".gpkg")
+    terra::writeVector(parks_vectors[parks_vectors$NAME == name,], file_name, overwrite=TRUE)
+})
+```
+
+load and mask the ndvi delta with each park's vector
+10 parks, 12 months, 120 files (each raster file has 2 years, NDVI and NDMI)
+
+```{r}
+ndvimi_diff_path <- "data/geotiff/ndvimi/difference_watermasked"
+ndvimi_diff_files <- file.path(ndvimi_diff_path,sprintf("NDVI_NDMI_diff_%d_watermasked.tif", 1:12))
+diff_rasters <- lapply(ndvimi_diff_files,terra::rast)
+ndvi_diff_stack <- terra::rast(lapply(diff_rasters,function(r) r[["NDVI_diff"]]))
+ndmi_diff_stack <- terra::rast(lapply(diff_rasters,function(r) r[["NDMI_diff"]]))
+
+for (i in 1:10){
+    # for each park, crop and mask the whole stack and save
+    park_vector <- parks_vectors[i]
+    park_vector <- terra::project(park_vector, "EPSG:32648")
+    ndvi_diff_stack_cropped <- terra::crop(ndvi_diff_stack, park_vector)
+    ndvi_diff_stack_masked <- terra::mask(ndvi_diff_stack_cropped, park_vector)
+    ndmi_diff_stack_cropped <- terra::crop(ndmi_diff_stack, park_vector)
+    ndmi_diff_stack_masked <- terra::mask(ndmi_diff_stack_cropped, park_vector)
+    output_dir <- here("data","geotiff","per_park_big","ndvimi",park_vector$NAME)
+    dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+    for (n in 1:12){
+        output_file <- file.path(output_dir, sprintf(paste0(park_vector$NAME, "ndvimi_difference_%d.tif"), n))
+        ndvimi_layers <- c(ndvi_diff_stack_masked[[n]], ndmi_diff_stack_masked[[n]])
+        terra::writeRaster(ndvimi_layers, output_file,overwrite=TRUE)
+    }
+}
+```
+
+do the same with precip:
+
+```{r}
+precip_diff_path <- "/Users/intan/Library/CloudStorage/Dropbox/NUS/MSc/BL5233/droughtNDVI/data/geotiff/climate_v2/precip/individual_years/mean_difference"
+# one 2-band raster per month (mean_monthly_daily_sum, cumulative_monthly); index n = calendar month n
+precip_diff_files <- file.path(precip_diff_path, c(
+    sprintf("mean_difference_2026_%02d.tif", 1:9),
+    sprintf("mean_difference_2025_%02d.tif", 10:12)))
+precip_diff_rasters <- lapply(precip_diff_files, function(f) terra::rast(f))
+for (i in 1:10){
+    # for each park, crop and mask each month and save
+    park_vector <- parks_vectors[i]
+    park_vector <- terra::project(park_vector, "EPSG:32648")
+    output_dir <- here("data","geotiff","per_park_big","precip",park_vector$NAME)
+    dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+    for (n in 1:12){
+        precip_diff_cropped <- terra::crop(precip_diff_rasters[[n]], park_vector)
+        precip_diff_masked <- terra::mask(precip_diff_cropped, park_vector)
+        output_file <- file.path(output_dir, sprintf(paste0(park_vector$NAME, "precip_difference_%d.tif"), n))
+        terra::writeRaster(precip_diff_masked, output_file,overwrite=TRUE)
+    }
+}
+```
+
+And now do the same to air temp
+
+```{r}
+temp_diff_path <- "/Users/intan/Library/CloudStorage/Dropbox/NUS/MSc/BL5233/droughtNDVI/data/geotiff/climate_v2/temp/individual_years/mean_difference"
+temp_diff_files <- file.path(temp_diff_path, c(
+    sprintf("mean_difference_2026_%02d.tif", 1:9),
+    sprintf("mean_difference_2025_%02d.tif", 10:12)))
+temp_diff_rasters <- lapply(temp_diff_files, function(f) terra::rast(f))
+for (i in 1:10){
+    # for each park, crop and mask each month and save
+    park_vector <- parks_vectors[i]
+    park_vector <- terra::project(park_vector, "EPSG:32648")
+    output_dir <- here("data","geotiff","per_park_big","temp",park_vector$NAME)
+    dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+    for (n in 1:12){
+        temp_diff_cropped <- terra::crop(temp_diff_rasters[[n]], park_vector)
+        temp_diff_masked <- terra::mask(temp_diff_cropped, park_vector)
+        output_file <- file.path(output_dir, sprintf(paste0(park_vector$NAME, "temp_difference_%d.tif"), n))
+        terra::writeRaster(temp_diff_masked, output_file,overwrite=TRUE)
+    }
+}
+```
+
+Save them as CSVs:
+
+```{r}
+park_pixels_to_tibble <- function(park_vectors, ndvimi_rasters, precip_rasters, temp_rasters, touches = FALSE){
+    park_vectors <- terra::project(park_vectors, "EPSG:32648")
+    purrr::map_dfr(1:12, function(n){
+        yr <- if (n <= 9) 2026 else 2025
+        precip <- precip_rasters[[n]]
+        names(precip) <- paste0("precip_", names(precip))
+        temp <- temp_rasters[[n]]
+        names(temp) <- paste0("temp_", names(temp))
+        layers <- c(ndvimi_rasters[[n]], precip, temp)
+        pixels <- terra::extract(layers, park_vectors, xy = TRUE, touches = touches)
+        pixels |>
+            mutate(
+                name = park_vectors$NAME[ID],
+                month = yearmonth(sprintf("%d-%02d-01", yr, n))
+            ) |>
+            select(name, month, x, y, everything(), -ID) |>
+            as_tibble()
+    })
+}
+
+park_pixels <- park_pixels_to_tibble(parks_vectors, diff_rasters, precip_diff_rasters, temp_diff_rasters)
+
+dir.create(here("data","csv"), recursive = TRUE, showWarnings = FALSE)
+write_csv(park_pixels, here("data","csv","park_pixels_big.csv"))
+
+```
+
+and summarising it per park:
+```{r}
+parks_all <- park_pixels |>
+    group_by(name, month) |>
+    summarise(
+        n_pixels_ndvi = sum(!is.na(NDVI_diff)),
+        mean_ndvi = mean(NDVI_diff, na.rm = TRUE),
+        sd_ndvi = sd(NDVI_diff, na.rm = TRUE),
+        mean_ndmi = mean(NDMI_diff, na.rm = TRUE),
+        sd_ndmi = sd(NDMI_diff, na.rm = TRUE),
+        across(starts_with(c("precip_", "temp_")), \(v) mean(v, na.rm = TRUE)),
+        .groups = "drop"
+    ) |>
+    pivot_longer(-c(name, month), names_to = "stats", values_to = "value")
+
+```
+
+summarise each park's NDMI, NDVI, temp and precip 
+one dataframe per variable
+column = parkname | month | variable | stats | value 
+
+Initialising the dataframe:
+```{r}
+parks_all <- tibble(
+    name = character(),
+    month = yearmonth(),
+    variable = character(),
+    stats = character(),
+    value = double()
+)
+```
+
+Loop through each park 
+and then loop through each month 
+and add one row at a time:
+
+```{r}
+for (i in 1:nrow(parks_vectors)){
+    parent_dir <- "/Users/intan/Library/CloudStorage/Dropbox/NUS/MSc/BL5233/droughtNDVI/data/geotiff/per_park_big"
+    park_vector <- parks_vectors[i]
+    for (m in 1:12){
+        if(m <= 9){
+            y = 2026
+        } else {
+            y= 2025
+        }
+        # open the files
+        month_pattern <- paste0("_", m, ".tif")
+        ndvimi <- terra::rast(list.files(path = paste0(parent_dir, "/ndvimi/", parks_vectors[i]$NAME), full.names =TRUE, pattern = month_pattern))
+        precip <- terra::rast(list.files(path = paste0(parent_dir, "/precip/", parks_vectors[i]$NAME), full.names =TRUE, pattern = month_pattern))
+        temp <- terra::rast(list.files(path = paste0(parent_dir, "/temp/", parks_vectors[i]$NAME), full.names =TRUE, pattern = month_pattern))
+        ndvi <- ndvimi[["NDVI_diff"]]
+        ndmi <- ndvimi[["NDMI_diff"]]
+        ndvi_vals <- terra::values(ndvi, mat = FALSE, na.rm = TRUE)
+        # find the mean ndvi
+        mean_ndvi <- mean(ndvi_vals)
+        # find the SD ndvi
+        sd_ndvi <- sd(ndvi_vals)
+        # write row
+        parks_all <- parks_all |>
+            add_row(
+                name = parks_vectors[i]$NAME,
+                month = yearmonth(sprintf("%d-%02d-01", y,m)),
+                variable = "ndvi",
+                stats = "mean_ndvi",
+                value = mean_ndvi
+            )
+        parks_all <- parks_all |>
+            add_row(
+                name = parks_vectors[i]$NAME,
+                month = yearmonth(sprintf("%d-%02d-01", y,m)),
+                variable = "ndvi",
+                stats = "sd_ndvi",
+                value = sd_ndvi
+            )   
+        # find the mean ndmi
+        ndmi_vals <- terra::values(ndmi, mat = FALSE, na.rm = TRUE)
+        mean_ndmi <- mean(ndmi_vals)
+                parks_all <- parks_all |>
+            add_row(
+                name = parks_vectors[i]$NAME,
+                month = yearmonth(sprintf("%d-%02d-01", y,m)),
+                variable = "ndmi",
+                stats = "mean_ndmi",
+                value = mean_ndmi
+            )
+        # find the SD ndmi
+        # write row
+        sd_ndmi <- sd(ndmi_vals)
+        parks_all <- parks_all |>
+            add_row(
+                name = parks_vectors[i]$NAME,
+                month = yearmonth(sprintf("%d-%02d-01", y,m)),
+                variable = "ndmi",
+                stats = "sd_ndmi",
+                value = sd_ndmi
+            )
+        
+        # write the temp row: mean_monthly_mean
+        mean_monthly_mean_temp_vals <- terra::values(temp[["mean_monthly_mean"]], mat = FALSE, na.rm = TRUE)
+        parks_all <- parks_all |>
+            add_row(
+                name = parks_vectors[i]$NAME,
+                month = yearmonth(sprintf("%d-%02d-01", y,m)),
+                variable = "temp",
+                stats = "mean_monthly_mean_temp",
+                value = mean(mean_monthly_mean_temp_vals)
+            )
+        # write the temp row: mean_monthly_max
+        mean_monthly_max_temp_vals <- terra::values(temp[["mean_monthly_max"]], mat = FALSE, na.rm = TRUE)
+        parks_all <- parks_all |>
+            add_row(
+                name = parks_vectors[i]$NAME,
+                month = yearmonth(sprintf("%d-%02d-01", y,m)),
+                variable = "temp",
+                stats = "mean_monthly_max_temp",
+                value = mean(mean_monthly_max_temp_vals)
+            )
+        # write the temp row: mean_monthly_min
+        mean_monthly_min_temp_vals <- terra::values(temp[["mean_monthly_min"]], mat = FALSE, na.rm = TRUE)
+        parks_all <- parks_all |>
+            add_row(
+                name = parks_vectors[i]$NAME,
+                month = yearmonth(sprintf("%d-%02d-01", y,m)),
+                variable = "temp",
+                stats = "mean_monthly_min_temp",
+                value = mean(mean_monthly_min_temp_vals)
+            )
+        # write temp row: max_monthly_max
+        max_monthly_max_temp_vals <- terra::values(temp[["max_monthly_max"]], mat = FALSE, na.rm = TRUE)
+        parks_all <- parks_all |>
+            add_row(
+                name = parks_vectors[i]$NAME,
+                month = yearmonth(sprintf("%d-%02d-01", y,m)),
+                variable = "temp",
+                stats = "max_monthly_max_temp",
+                value = mean(max_monthly_max_temp_vals)
+            )
+        # write temp row: min_monthly_min
+        min_monthly_min_temp_vals <- terra::values(temp[["min_monthly_min"]], mat = FALSE, na.rm = TRUE)
+        parks_all <- parks_all |>
+            add_row(
+                name = parks_vectors[i]$NAME,
+                month = yearmonth(sprintf("%d-%02d-01", y,m)),
+                variable = "temp",
+                stats = "min_monthly_min_temp",
+                value = mean(min_monthly_min_temp_vals)
+            )
+        # write the precip rows: mean over pixels = mean of the voronoi values weighted by how many park pixels each covers
+        mean_monthly_daily_sum_precip_vals <- terra::values(precip[["mean_monthly_daily_sum"]], mat = FALSE, na.rm = TRUE)
+        parks_all <- parks_all |>
+            add_row(
+                name = parks_vectors[i]$NAME,
+                month = yearmonth(sprintf("%d-%02d-01", y,m)),
+                variable = "precip",
+                stats = "mean_monthly_daily_sum_precip",
+                value = mean(mean_monthly_daily_sum_precip_vals)
+            )
+        cumulative_monthly_precip_vals <- terra::values(precip[["cumulative_monthly"]], mat = FALSE, na.rm = TRUE)
+        parks_all <- parks_all |>
+            add_row(
+                name = parks_vectors[i]$NAME,
+                month = yearmonth(sprintf("%d-%02d-01", y,m)),
+                variable = "precip",
+                stats = "cumulative_monthly_precip",
+                value = mean(cumulative_monthly_precip_vals)
+            )
+    }
+}
+```
+
+now, save parks_all into a csv
+
+```{r}
+write_csv(parks_all,"/Users/intan/Library/CloudStorage/Dropbox/NUS/MSc/BL5233/droughtNDVI/data/csv/parks_all_big.csv")
+```
+
+quick plot:
+```{r}
+ggplot(data=parks_all[parks_all$stats == "mean_ndmi",], aes(x = month, y = value, colour=name)) + geom_point() + geom_smooth(method="loess", se=FALSE) + labs(
+    y="Mean_NDMI"
+)
+```
+
+let's quickly find the outliers of the parks NDMI and NDVI by making a boxplot
+
+```{r}
+parks_all |>
+    filter(stats %in% c("mean_ndvi", "mean_ndmi"), is.finite(value)) |>
+    ggplot(aes(x = factor(month), y = value)) +
+    geom_boxplot() +
+    facet_wrap(~ stats, ncol = 1, scales = "free_y") +
+    labs(x = "Month", y = "Difference from baseline")
+
+ndvimi_outliers <- parks_all |>
+    filter(stats %in% c("mean_ndvi", "mean_ndmi"), is.finite(value)) |>
+    group_by(stats, month) |>
+    mutate(
+        q1 = quantile(value, 0.25),
+        q3 = quantile(value, 0.75),
+        iqr = q3 - q1,
+        is_outlier = value < q1 - 1.5 * iqr | value > q3 + 1.5 * iqr
+    ) |>
+    ungroup() |>
+    filter(is_outlier) |>
+    select(name, month, stats, value)
+
+
+```
+
+which parks are town parks?
+criteria: less than 50% of 1km buffer around park are nature areas
+
+load the spatvectors of each park shapes
+
+make a function that creates 1km buffer around each park shape 
+func(shp, buffer=1km, threshold=0.5, raster_path)
+this function returns TRUE or FALSE if the park contains >50% nature 
+
+loop through all the parks shps with the function and also write a new dataframe that contains name and connected
+
+# Giant CSV with pixel for every park for every month of October 2022 to September 2026
+
+NO MORE MEAN DIFFERENCE
+
+Turn all the monthly rasters from October 2020 to September 2026 per pixel into csv per park
+
+Column format:
+park name | x_coord | y_coord | month | year | variable | stats | value
+variable and stats will be: mean NDVI, mean NDMI, mean monthly mean temp, mean monthly max temp, mean monthly min temp, max monthly max temp, min monthly min temp, cumulative monthly precip, monthly mean daily precip
+
+```{r}
+csv_all <- tibble(
+    name = character(),
+    x = double(),
+    y = double(),
+    month = month(),
+    year = year(),
+    variable = character(),
+    stats = character(),
+    value = double()
+)
+```

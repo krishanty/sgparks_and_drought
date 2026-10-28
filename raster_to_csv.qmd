@@ -1,0 +1,285 @@
+
+# Giant CSV for every park for every month of October 2022 to September 2026
+
+load libraries:
+```{r}
+library(tidyverse)
+library(terra)
+library(sf)
+library(here)
+library(tsibble)
+library(tidyterra)
+```
+NO MORE MEAN DIFFERENCE
+
+Turn all the monthly rasters from October 2020 to September 2026 per pixel into csv per park
+
+Column format:
+park name | month | year | variable | stats | value
+variable and stats will be: mean NDVI, mean NDMI, mean monthly mean temp, mean monthly max temp, mean monthly min temp, max monthly max temp, min monthly min temp, cumulative monthly precip, monthly mean daily precip
+
+Initiatilise the tibble:
+```{r}
+csv_all <- tibble(
+    name = character(),
+    month = double(),
+    year = double(),
+    variable = character(),
+    stats = character(),
+    value = double()
+)
+```
+
+Parks vectors:
+```{r}
+parks_vectors <- do.call(rbind, lapply(list.files("data/shp/parks", pattern = "\\.gpkg$", full.names = TRUE), terra::vect))
+```
+First: collect the rasters
+NDVIMI: `data/geotiff/ndvimi/individual_years` 
+precip: `/data/geotiff/climate_v2/precip/individual_years`
+temp: `/data/geotiff/climate_v2/temp/individual_years`
+
+Second: clip against the park shapes `data/shp/parks`
+(make a function)
+
+Third: add row to the dataframe 
+
+```{r}
+ndvimi_files <- list.files("data/geotiff/ndvimi/individual_years", recursive = TRUE, full.names = TRUE, pattern = "\\.tif$")
+ndvimi_stack <- terra::rast(ndvimi_files)
+ndvi_stack <- ndvimi_stack[[names(ndvimi_stack) == "NDVI"]]
+ndmi_stack <- ndvimi_stack[[names(ndvimi_stack) == "NDMI"]]
+# now to clip against park shapes
+
+for (i in 1:nrow(parks_vectors)){
+    park_vector <- parks_vectors[i]
+    print(sprintf("checking NDVIMI of %s", park_vector$NAME))
+    park_vector <- terra::project(park_vector, "EPSG:32648")
+    ndvi_stack_cropped <- terra::crop(ndvi_stack, park_vector)
+    ndvi_stack_masked <- terra::mask(ndvi_stack_cropped, park_vector)
+    ndmi_stack_cropped <- terra::crop(ndmi_stack, park_vector)
+    ndmi_stack_masked <- terra::mask(ndmi_stack_cropped, park_vector)
+    output_dir <- here("data","geotiff","per_park_per_year","ndvimi_",park_vector$NAME)
+    dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+    for (n in 1:length(sources(ndvimi_stack))){
+        base_path <- basename(sources(ndvimi_stack)[n])
+        pattern <- "_([0-9]{4})_([0-9]{1,2})\\.tif$"
+        matches <- regmatches(base_path, regexec(pattern, base_path))[[1]]
+        year <- as.double(matches[2])
+        month <- as.double(matches[3])
+        print(sprintf("Checking %d %02d", year, month))
+        ndvi <- ndvi_stack_masked[[n]]
+        ndmi <- ndmi_stack_masked[[n]]
+        ndvi_vals <- terra::values(ndvi, mat = FALSE, na.rm = TRUE)
+        # find the mean ndvi
+        mean_ndvi <- mean(ndvi_vals)
+        # find the SD ndvi
+        sd_ndvi <- sd(ndvi_vals)
+        ndmi_vals <- terra::values(ndmi, mat = FALSE, na.rm = TRUE)
+        mean_ndmi <- mean(ndmi_vals)
+        sd_ndmi <- sd(ndmi_vals)
+        csv_all <- csv_all |>
+            add_row(
+                name = parks_vectors[i]$NAME,
+                year = year,
+                month = month,
+                variable = "ndvi",
+                stats = "mean_ndvi",
+                value = mean_ndvi
+            ) |>
+            add_row(
+                name = parks_vectors[i]$NAME,
+                year = year,
+                month = month,
+                variable = "ndvi",
+                stats = "sd_ndvi",
+                value = sd_ndvi
+            )   |>
+                add_row(
+                name = parks_vectors[i]$NAME,
+                year = year,
+                month = month,
+                variable = "ndmi",
+                stats = "mean_ndmi",
+                value = mean_ndmi
+            )   |>
+                add_row(
+                name = parks_vectors[i]$NAME,
+                year = year,
+                month = month,
+                variable = "ndmi",
+                stats = "sd_ndmi",
+                value = sd_ndmi
+            )  |>
+            add_row(name = parks_vectors[i]$NAME, 
+            year = year, 
+            month = month,
+            variable = "ndvi", 
+            stats = "n_pixels", 
+            value = length(ndvi_vals)) |>
+            add_row(name = parks_vectors[i]$NAME, 
+            year = year, 
+            month = month,
+            variable = "ndmi", 
+            stats = "n_pixels", 
+            value = length(ndmi_vals))
+
+        output_file <- file.path(output_dir, paste0(park_vector$NAME, base_path))
+        ndvimi_layers <- c(ndvi, ndmi)
+        terra::writeRaster(ndvimi_layers, output_file,overwrite=TRUE)
+    }
+}
+```
+
+precip:
+
+```{r}
+precip_files <- list.files("data/geotiff/climate_v2/precip/individual_years", recursive = TRUE, full.names = TRUE, pattern = "\\.tif$")
+precip_stack <- terra::rast(precip_files)
+daily_sum_stack <- precip_stack[[names(precip_stack) == "mean_monthly_daily_sum"]]
+cumulative_stack <- precip_stack[[names(precip_stack) == "cumulative_monthly"]]
+for (i in 1:nrow(parks_vectors)){
+    park_vector <- parks_vectors[i]
+    print(sprintf("checking precip of %s", park_vector$NAME))
+    park_vector <- terra::project(park_vector, "EPSG:32648")
+    daily_sum_masked <- terra::mask(terra::crop(daily_sum_stack, park_vector), park_vector)
+    cumulative_masked <- terra::mask(terra::crop(cumulative_stack, park_vector), park_vector)
+    output_dir <- here("data","geotiff","per_park_per_year","precip_",park_vector$NAME)
+    dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+    for (n in 1:length(sources(precip_stack))){
+        base_path <- basename(sources(precip_stack)[n])
+        pattern <- "_([0-9]{4})_([0-9]{1,2})\\.tif$"
+        matches <- regmatches(base_path, regexec(pattern, base_path))[[1]]
+        year <- as.double(matches[2])
+        month <- as.double(matches[3])
+        print(sprintf("Checking %d %02d", year, month))
+        mean_monthly_daily_sum_precip_vals <- terra::values(daily_sum_masked[[n]], mat = FALSE, na.rm = TRUE)
+        cumulative_monthly_precip_vals <- terra::values(cumulative_masked[[n]], mat = FALSE, na.rm = TRUE)
+        csv_all <- csv_all |>
+            add_row(
+                name = parks_vectors[i]$NAME,
+                year = year,
+                month = month,
+                variable = "precip",
+                stats = "mean_monthly_daily_sum_precip",
+                value = mean(mean_monthly_daily_sum_precip_vals)
+            )
+        csv_all <- csv_all |>
+            add_row(
+                name = parks_vectors[i]$NAME,
+                year = year,
+                month = month,
+                variable = "precip",
+                stats = "cumulative_monthly_precip",
+                value = mean(cumulative_monthly_precip_vals)
+            )
+        output_file <- file.path(output_dir, paste0(park_vector$NAME, base_path))
+        terra::writeRaster(c(daily_sum_masked[[n]], cumulative_masked[[n]]), output_file, overwrite=TRUE)
+    }
+}
+```
+
+temp:
+```{r}
+temp_files <- list.files("data/geotiff/climate_v2/temp/individual_years", recursive = TRUE, full.names = TRUE, pattern = "\\.tif$")
+temp_stack <- terra::rast(temp_files)
+mean_monthly_mean_stack <- temp_stack[[names(temp_stack) == "mean_monthly_mean"]]
+mean_monthly_max_stack <- temp_stack[[names(temp_stack) == "mean_monthly_max"]]
+mean_monthly_min_stack <- temp_stack[[names(temp_stack) == "mean_monthly_min"]]
+max_monthly_max_stack <- temp_stack[[names(temp_stack) == "max_monthly_max"]]
+min_monthly_min_stack <- temp_stack[[names(temp_stack) == "min_monthly_min"]]
+for (i in 1:nrow(parks_vectors)){
+    park_vector <- parks_vectors[i]
+    print(sprintf("checking temp of %s", park_vector$NAME))
+    park_vector <- terra::project(park_vector, "EPSG:32648")
+    mean_monthly_mean_masked <- terra::mask(terra::crop(mean_monthly_mean_stack , park_vector), park_vector)
+    mean_monthly_max_masked <- terra::mask(terra::crop(mean_monthly_max_stack, park_vector), park_vector)
+    mean_monthly_min_masked <- terra::mask(terra::crop(mean_monthly_min_stack, park_vector), park_vector)
+    max_monthly_max_masked <- terra::mask(terra::crop(max_monthly_max_stack, park_vector), park_vector)
+    min_monthly_min_masked <- terra::mask(terra::crop(min_monthly_min_stack, park_vector), park_vector)
+    output_dir <- here("data","geotiff","per_park_per_year","temp_",park_vector$NAME)
+    dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+    for (n in 1:length(sources(temp_stack))){
+        base_path <- basename(sources(temp_stack)[n])
+        pattern <- "_([0-9]{4})_([0-9]{1,2})\\.tif$"
+        matches <- regmatches(base_path, regexec(pattern, base_path))[[1]]
+        year <- as.double(matches[2])
+        month <- as.double(matches[3])
+        print(sprintf("Checking %d %02d", year, month))
+        mean_monthly_max_temp_vals <- terra::values(mean_monthly_max_masked[[n]], mat = FALSE, na.rm = TRUE)
+        csv_all <- csv_all |>
+            add_row(
+                name = parks_vectors[i]$NAME,
+                year = year,
+                month=month,
+                variable = "temp",
+                stats = "mean_monthly_max_temp",
+                value = mean(mean_monthly_max_temp_vals)
+            )
+        mean_monthly_mean_temp_vals <- terra::values(mean_monthly_mean_masked[[n]], mat = FALSE, na.rm = TRUE)
+        csv_all <- csv_all |>
+            add_row(
+                name = parks_vectors[i]$NAME,
+                year = year,
+                month=month,
+                variable = "temp",
+                stats = "mean_monthly_mean_temp",
+                value = mean(mean_monthly_mean_temp_vals)
+            )
+        mean_monthly_min_temp_vals <- terra::values(mean_monthly_min_masked[[n]], mat = FALSE, na.rm = TRUE)
+        csv_all <- csv_all |>
+            add_row(
+                name = parks_vectors[i]$NAME,
+                year = year,
+                month=month,
+                variable = "temp",
+                stats = "mean_monthly_min_temp",
+                value = mean(mean_monthly_min_temp_vals)
+            )
+        max_monthly_max_temp_vals <- terra::values(max_monthly_max_masked[[n]], mat = FALSE, na.rm = TRUE)
+        csv_all <- csv_all |>
+            add_row(
+                name = parks_vectors[i]$NAME,
+                year = year,
+                month=month,
+                variable = "temp",
+                stats = "max_monthly_max_temp",
+                value = mean(max_monthly_max_temp_vals)
+            )
+        min_monthly_min_temp_vals <- terra::values(min_monthly_min_masked[[n]], mat = FALSE, na.rm = TRUE)
+        csv_all <- csv_all |>
+            add_row(
+                name = parks_vectors[i]$NAME,
+                year = year,
+                month=month,
+                variable = "temp",
+                stats = "min_monthly_min_temp",
+                value = mean(min_monthly_min_temp_vals)
+            )
+        output_file <- file.path(output_dir, paste0(park_vector$NAME, base_path))
+        terra::writeRaster(c(mean_monthly_max_masked[[n]], mean_monthly_mean_masked[[n]], mean_monthly_min_masked[[n]], max_monthly_max_masked[[n]], min_monthly_min_masked[[n]]), output_file, overwrite=TRUE)
+    }
+}
+```
+
+Fourth: save as CSV 
+
+```{r}
+write_csv(csv_all, "data/csv/parks_all_years.csv")
+```
+
+Turning the statistics figures into shape files too so that I can plot them better for the presentation:
+1. pivot the csv_all dataframe wider 
+2. use tidyterra to join parks_vectors with the wider csv_all
+
+```{r}
+wider_csv_all <- csv_all |>
+    pivot_wider(id_cols = c("name", "year", "month"), names_from = "stats", values_from = "value")
+
+parks_vectors_joined <- parks_vectors |>
+    select(NAME) |>
+    inner_join(wider_csv_all, by = c("NAME" = "name")) |>
+    mutate(across(!NAME, ~as.double(.x)))
+
+terra::writeVector(parks_vectors_joined, here("data", "shp", "parks_stats.gpkg"),overwrite=TRUE)
+```

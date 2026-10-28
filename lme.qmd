@@ -1,0 +1,98 @@
+Loading required libraries:
+```{r}
+library(lmerTest)       
+library(lattice)     
+library(tidyverse)
+library(tsibble)
+```
+
+parks type:
+```{r}
+urban_parks <- c("ADMIRALTY PK", "BUKIT BATOK NATURE PARK", "BUKIT BATOK TOWN PARK",
+                 "MOUNT FABER PARK", "TAMPINES ECO GREEN PK")
+buffer_parks <- c("CHESTNUT NATURE PARK", "RIFLE RANGE NATURE PARK", "WINDSOR NATURE PARK",
+                  "THOMSON NATURE PARK", "DAIRY FARM NATURE PARK")
+```
+
+load data:
+```{r}
+parks <- read_csv("data/csv/parks_all_years.csv", col_names=TRUE) |>
+    mutate(
+    year_month = tsibble::make_yearmonth(year = year, month = month),
+    time = as.numeric(year_month - min(year_month))
+  ) 
+wider_data_ndvi <- parks |>
+    filter(variable != "ndmi")|>
+    mutate(type = if_else(name %in% urban_parks, 1, 0)) %>%                
+    pivot_wider(id_cols = c(name, year, month, type, year_month),
+        names_from = stats,
+        values_from = value) |>
+    mutate(across(c(name, type, year, month), \(x)as.factor(x))) |>
+    select(name, month, year, year_month, type, mean_ndvi, cumulative_monthly_precip,mean_monthly_max_temp,mean_monthly_mean_temp) |>
+    arrange(name, year_month) |>
+    group_by(name) |>
+    mutate(precip_lag1 = dplyr::lag(cumulative_monthly_precip, 1),
+        precip_lag2 = dplyr::lag(cumulative_monthly_precip, 2),
+        max_temp_lag1 = dplyr::lag(mean_monthly_max_temp, 1),
+        max_temp_lag2 = dplyr::lag(mean_monthly_max_temp, 2),
+        mean_temp_lag1 = dplyr::lag(mean_monthly_mean_temp, 1),
+        mean_temp_lag2 = dplyr::lag(mean_monthly_mean_temp, 2)) |>
+    filter(!is.na(mean_ndvi)) |>
+    ungroup() |>
+    mutate(across(where(is.numeric) & !mean_ndvi, \(x) as.numeric(scale(x)))) |>
+    drop_na(mean_ndvi, type, cumulative_monthly_precip, mean_monthly_max_temp, precip_lag1)
+
+
+wider_data_ndmi <- parks |>
+    filter(variable != "ndvi")|>
+    mutate(type = if_else(name %in% urban_parks, 1, 0)) %>%                
+    pivot_wider(id_cols = c(name, year, month, type, year_month),
+        names_from = stats,
+        values_from = value) |>
+    mutate(across(c(name, type, year, month), \(x)as.factor(x))) |>
+    select(name, month, year, type, year_month, mean_ndmi, cumulative_monthly_precip,mean_monthly_max_temp,mean_monthly_mean_temp) |>
+    arrange(name, year_month) |>
+    group_by(name) |>
+    mutate(precip_lag1 = dplyr::lag(cumulative_monthly_precip, 1),
+        precip_lag2 = dplyr::lag(cumulative_monthly_precip, 2),
+        max_temp_lag1 = dplyr::lag(mean_monthly_max_temp, 1),
+        max_temp_lag2 = dplyr::lag(mean_monthly_max_temp, 2),
+        mean_temp_lag1 = dplyr::lag(mean_monthly_mean_temp, 1),
+        mean_temp_lag2 = dplyr::lag(mean_monthly_mean_temp, 2)) |>
+    filter(!is.na(mean_ndmi)) |>
+    ungroup() |>
+    mutate(across(where(is.numeric) & !mean_ndmi, \(x) as.numeric(scale(x)))) 
+
+ndvi_lme_data <- wider_data_ndvi |>
+    drop_na(mean_ndvi, type, cumulative_monthly_precip, mean_monthly_max_temp, mean_monthly_mean_temp, precip_lag1, precip_lag2, max_temp_lag1, max_temp_lag2, mean_temp_lag1, mean_temp_lag2)
+
+ndmi_lme_data <- wider_data_ndmi |>
+    drop_na(mean_ndmi, type, cumulative_monthly_precip, mean_monthly_max_temp, mean_monthly_mean_temp, precip_lag1, precip_lag2, max_temp_lag1, max_temp_lag2, mean_temp_lag1, mean_temp_lag2)
+
+```
+
+plot plot plot 
+
+```{r}
+ggplot(data=wider_data_ndmi, aes())
+```
+
+
+use max temp for the lme:
+
+```{r}
+ndvi_lme <- lmer(mean_ndvi ~ . - month - name -year - year_month + (1|month) + (1|name), data=wider_data_ndvi)
+
+ndmi_lme <- lmer(mean_ndmi ~ . -month - name -year - year_month + (1|month) + (1|name), data=wider_data_ndmi)
+```
+
+checking resids:
+
+```{r}
+plot(ndvi_lme) 
+qqnorm(resid(ndvi_lme))
+qqline(resid(ndvi_lme))             
+lattice::qqmath(ranef(ndvi_lme))                            
+acf(resid(ndvi_lme)[order(wider_data_ndvi$name, wider_data_ndvi$year_month)]) 
+
+```

@@ -637,13 +637,13 @@ baseline_quality
 pixel_diff_2026_map <- pixel_diff_2026_sg |>
   filter(
     !is.na(ndvi_difference),
-    n_years_ndvi >= 3
+    n_years_ndvi >= 2
   )
 
 pixel_diff_2026_map_ndmi <- pixel_diff_2026_sg |>
   filter(
     !is.na(ndmi_difference),
-    n_years_ndmi >= 3
+    n_years_ndmi >= 2
   )
 ```
 
@@ -682,7 +682,7 @@ ggplot() +
   ) +
   labs(
     title = "2026 NDVI Anomaly",
-    subtitle = "Difference from 2021–2025 monthly baseline (≥3 historical years)",
+    subtitle = "Difference from 2021–2025 monthly baseline (≥2 historical years)",
     x = NULL,
     y = NULL,
     colour = "NDVI\ndifference"
@@ -725,7 +725,7 @@ ggplot() +
   ) +
   labs(
     title = "2026 NDMI Anomaly",
-    subtitle = "Difference from 2021–2025 monthly baseline (≥3 historical years)",
+    subtitle = "Difference from 2021–2025 monthly baseline (≥2 historical years)",
     x = NULL,
     y = NULL,
     colour = "NDMI\ndifference"

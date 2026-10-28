@@ -360,8 +360,8 @@ for (month in 1:12){
     
     ndmi_diff <- current_file_ndmi - average_file_ndmi
     ndvi_diff <- current_file_ndvi - average_file_ndvi
-    ndvi_diff[average_raster[["NDVI_nyears"]] < 3] <- NA
-    ndmi_diff[average_raster[["NDMI_nyears"]] < 3] <- NA
+    ndvi_diff[average_raster[["NDVI_nyears"]] < 2] <- NA
+    ndmi_diff[average_raster[["NDMI_nyears"]] < 2] <- NA
     diff_raster <- c(ndvi_diff, ndmi_diff)
     names(diff_raster) <- c("NDVI_diff", "NDMI_diff")
     
@@ -439,7 +439,7 @@ ndvi_diff_plot <- ggplot(ndvi_diff_df, aes(x=x, y=y, fill = NDVI_diff)) +
     coord_equal() +
     theme_minimal() +
     labs(title = "Monthly Mean NDVI Anomaly, October 2025 - September 2026",
-         subtitle = "Compared to at least 3-years mean from October 2020–September 2025",
+         subtitle = "Compared to at least 2-years mean from October 2020–September 2025",
          x= NULL,
          y = NULL,
          fill = "Delta NDVI")
@@ -461,7 +461,7 @@ ndmi_diff_plot <- ggplot(ndmi_diff_df, aes(x=x, y=y, fill = NDMI_diff)) +
     coord_equal() +
     theme_minimal() +
     labs(title = "Monthly Mean NDMI Anomaly, October 2025 - September 2026",
-         subtitle = "Compared to at least 3-years mean from October 2020–September 2025",
+         subtitle = "Compared to at least 2-years mean from October 2020–September 2025",
          x= NULL,
          y = NULL,
          fill = "Delta NDMI")
@@ -488,7 +488,7 @@ ndmi_masked_plot <- ggplot(ndmi_masked, aes(x=x, y=y, fill = NDMI_diff)) +
     coord_equal() +
     theme_minimal() +
     labs(title = "Monthly Mean NDMI Anomaly, October 2025 - September 2026 (negative only)",
-         subtitle = "Compared to at least 3-years mean from October 2020–September 2025",
+         subtitle = "Compared to at least 2-years mean from October 2020–September 2025",
          x= NULL,
          y = NULL,
          fill = "Delta NDMI")
@@ -512,7 +512,7 @@ ndvi_masked_plot <- ggplot(ndvi_masked, aes(x=x, y=y, fill = NDVI_diff)) +
     coord_equal() +
     theme_minimal() +
     labs(title = "Monthly Mean NDVI Anomaly, October 2025 - September 2026 (negative only)",
-         subtitle = "Compared to at least 3-years mean from October 2020–September 2025",
+         subtitle = "Compared to at least 2-years mean from October 2020–September 2025",
          x= NULL,
          y = NULL,
          fill = "Delta NDVI")
@@ -1052,13 +1052,13 @@ ndvi_diff_watermasked_plot <- ggplot(ndvi_diff_watermasked_df, aes(x=x, y=y, fil
     mid = "white",
     high = "darkgreen",
     midpoint = 0,
-    limits = c(-ndvi_limit, ndvi_limit),
+    limits = c(-ndvi_limit_watermasked, ndvi_limit_watermasked),
     oob = scales::squish,
     na.value = "grey90") +
     coord_equal() +
     theme_minimal() +
     labs(title = "Monthly Mean NDVI Anomaly, October 2025 - September 2026 with water body masked out",
-         subtitle = "Compared to at least 3-years mean from October 2020–September 2025",
+         subtitle = "Compared to at least 2-years mean from October 2020–September 2025",
          x= NULL,
          y = NULL,
          fill = "Delta NDVI")
@@ -1074,13 +1074,13 @@ ndmi_diff_watermasked_plot <- ggplot(ndmi_diff_watermasked_df, aes(x=x, y=y, fil
     mid = "white",
     high = "dodgerblue4",
     midpoint = 0,
-    limits = c(-ndmi_limit, ndmi_limit),
+    limits = c(-ndmi_limit_watermasked, ndmi_limit_watermasked),
     oob = scales::squish,
     na.value = "grey90") +
     coord_equal() +
     theme_minimal() +
     labs(title = "Monthly Mean NDMI Anomaly, October 2025 - September 2026 with water body masked out",
-         subtitle = "Compared to at least 3-years mean from October 2020–September 2025",
+         subtitle = "Compared to at least 2-years mean from October 2020–September 2025",
          x= NULL,
          y = NULL,
          fill = "Delta NDMI")
@@ -1274,21 +1274,7 @@ and call the function:
 create_monthly_csvs(template_output_path)
 ```
 
-Load all the rasters for precip and turn into csv
 
-```{r}
-```
-
-
-Load all the rasters for air temp and turn into csv
-
-Load all the rasters for mean difference for precip and turn into csv
-
-Load all the rasters for mean difference for temp and turn into csv
-
-Load all the rasters for NDMI difference into CSV
-
-load all the rasters for ndvi difference and turn into csv
 # Final step: close duckDB connection
 ```{r}
 dbDisconnect(duck_con, shutdown = TRUE)
