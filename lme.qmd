@@ -132,5 +132,49 @@ anova(ndvi_final_model_no_temp, ndvi_final_model_no_lag)
 
 another possible model
 ```{r}
-
+ndvi_no_temp_model <- lmer(mean_ndvi ~ type*precip_lag1*precip_lag2*cumulative_monthly_precip + (1|month) + (1|name), data=ndvi_lme_data)
+# ndvi_no_temp_model_2 <- update(ndvi_no_temp_model, ~. -type:precip_lag1:precip_lag2:cumulative_monthly_precip )
+# ndvi_no_temp_model_3 <- update(ndvi_no_temp_model_2, ~. -type:precip_lag2:cumulative_monthly_precip)
+# ndvi_no_temp_model_4 <- update(ndvi_no_temp_model_3, ~. -type:precip_lag1:precip_lag2)
+# ndvi_no_temp_model_5 <- update(ndvi_no_temp_model_4, ~. -type:precip_lag1:cumulative_monthly_precip)
+# ndvi_no_temp_model_6 <- update(ndvi_no_temp_model_5, ~. -precip_lag1:precip_lag2:cumulative_monthly_precip)
+# ndvi_no_temp_model_7 <- update(ndvi_no_temp_model_6, ~. -precip_lag2:cumulative_monthly_precip)
+# ndvi_no_temp_model_8 <- update(ndvi_no_temp_model_7, ~. -type:cumulative_monthly_precip)
+# ndvi_no_temp_model_9 <- update(ndvi_no_temp_model_8, ~. -precip_lag1:cumulative_monthly_precip )
+lmerTest::step(ndvi_no_temp_model)
 ```
+
+Another model
+```{r}
+ndvi_precip <- lmer(mean_ndvi ~ type * (cumulative_monthly_precip + precip_lag1 + precip_lag2) +
+                      (1|month) + (1|name),
+                    data = ndvi_lme_data, REML = FALSE)
+final_model_ndvi <- lmerTest::step(ndvi_precip)
+```
+
+```{r}
+ndvi_temp_precip <- lmer(mean_ndvi ~ type * (cumulative_monthly_precip + precip_lag1 + precip_lag2 + mean_monthly_max_temp + mean_monthly_mean_temp) +
+                      (1|month) + (1|name),
+                    data = ndvi_lme_data, REML = FALSE)
+final_model_temp_ndvi <- lmerTest::step(ndvi_temp_precip)
+```
+
+no-lag comparison
+```{r}
+ndvi_no_lag <- lmer(mean_ndvi ~ type * (cumulative_monthly_precip + mean_monthly_max_temp + mean_monthly_mean_temp) +
+                      (1|month) + (1|name),
+                    data = ndvi_lme_data, REML = FALSE)
+ndvi_no_lag_step <- lmerTest::step(ndvi_no_lag)
+```
+
+ML comparison for AIC
+```{r}
+no_temp_mod <- lmer(mean_ndvi ~ type + precip_lag1 + (1 | month) + (1 | name), data=ndvi_lme_data, REML= FALSE)
+temp_lag_mod <- lmer(mean_ndvi ~ type + precip_lag1 + max_temp_lag2 + type:precip_lag1 + (1|month) + (1|name), data=ndvi_lme_data, REML= FALSE)
+temp_mod <- lmer(mean_ndvi ~ type + precip_lag1 + mean_monthly_max_temp + type:precip_lag1 + (1|month) + (1|name), data=ndvi_lme_data, REML= FALSE)
+final_model_ndvi <- lmer(mean_ndvi ~ type + precip_lag1 + (1 | month) + (1 | name) + type:precip_lag1, data=ndvi_lme_data, REML=FALSE)
+final_model_temp_ndvi <- lmer(mean_ndvi ~ type + precip_lag1 + (1 | month) + (1 | name) + type:precip_lag1, data=ndvi_lme_data, REML=FALSE)
+no_lag_mod <- lmer(mean_ndvi ~ type + (1 | month) + (1 | name), data=ndvi_lme_data, REML=FALSE)
+AIC(no_temp_mod, temp_lag_mod, temp_mod,ndvi_precip,final_model_temp_ndvi,no_lag_mod)
+```
+
