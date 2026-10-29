@@ -80,9 +80,18 @@ ggplot(data=wider_data_ndmi, aes())
 use max temp for the lme:
 
 ```{r}
-ndvi_lme <- lmer(mean_ndvi ~ . - month - name -year - year_month - n_pixels -time + (1|month) + (1|name), data=ndvi_lme_data)
+ndvi_lme <- lmer(mean_ndvi ~ . - month - name -year - year_month - n_pixels  + (1|month) + (1|name), data=ndvi_lme_data)
 
-ndmi_lme <- lmer(mean_ndmi ~ . -month - name -year - year_month - n_pixels -time + (1|month) + (1|name), data=ndmi_lme_data)
+ndmi_lme <- lmer(mean_ndmi ~ . -month - name -year - year_month - n_pixels + (1|month) + (1|name), data=ndmi_lme_data)
+```
+
+less lazy and add interaction terms:
+
+```{r}
+ndvi_lme_intx <- lmer(mean_ndvi ~ type + cumulative_monthly_precip * mean_monthly_max_temp * mean_monthly_mean_temp * precip_lag1 * precip_lag2 * max_temp_lag1 * max_temp_lag2 * mean_temp_lag1 * mean_temp_lag2 + (1|month) + (1|name), data=ndvi_lme_data)
+ndmi_lme_intx <- lmer(mean_ndmi ~ type + cumulative_monthly_precip * mean_monthly_max_temp * mean_monthly_mean_temp * precip_lag1 * precip_lag2 * max_temp_lag1 * max_temp_lag2 * mean_temp_lag1 * mean_temp_lag2 + (1|month) + (1|name), data=ndmi_lme_data)
+
+summary(ndvi_lme_intx)
 ```
 
 checking resids:
@@ -103,5 +112,25 @@ ndvi_lme_data |>
     mutate(resid = resid(ndvi_lme)) |>
     arrange(resid) |>
     select(name, year_month, mean_ndvi, n_pixels, resid)
+
+```
+
+possible model:
+```{r}
+ndvi_good_model <- lmer(mean_ndvi ~ type*precip_lag1*mean_monthly_max_temp + (1|month) + (1|name), data=ndvi_lme_data)
+
+ndvi_final_model_with_lag <- lmer(mean_ndvi ~ type + precip_lag1 + mean_monthly_max_temp + max_temp_lag2 + type:precip_lag1 + (1|month) + (1|name), data=ndvi_lme_data)
+
+ndvi_final_model_no_lag <- lmer(mean_ndvi ~ type + precip_lag1 + mean_monthly_max_temp + type:precip_lag1 + (1|month) + (1|name), data=ndvi_lme_data)
+
+ndvi_final_model_no_temp <- lmer(mean_ndvi ~ type + precip_lag1 + type:precip_lag1 + (1|month) + (1|name), data=ndvi_lme_data)
+
+AIC(ndvi_final_model_with_lag, ndvi_final_model_no_lag)
+anova(ndvi_final_model_with_lag, ndvi_final_model_no_lag)
+anova(ndvi_final_model_no_temp, ndvi_final_model_no_lag)
+```
+
+another possible model
+```{r}
 
 ```
