@@ -40,7 +40,7 @@ wider_data_ndvi <- parks |>
         mean_temp_lag2 = dplyr::lag(mean_monthly_mean_temp, 2)) |>
     filter(!is.na(mean_ndvi)) |>
     ungroup() |>
-    mutate(across(where(is.numeric) & !mean_ndvi, \(x) as.numeric(scale(x))))
+    mutate(across(where(is.numeric) & !mean_ndvi &!n_pixels, \(x) as.numeric(scale(x))))
 
 wider_data_ndmi <- parks |>
     filter(variable != "ndvi")|>
@@ -60,7 +60,7 @@ wider_data_ndmi <- parks |>
         mean_temp_lag2 = dplyr::lag(mean_monthly_mean_temp, 2)) |>
     filter(!is.na(mean_ndmi)) |>
     ungroup() |>
-    mutate(across(where(is.numeric) & !mean_ndmi, \(x) as.numeric(scale(x)))) 
+    mutate(across(where(is.numeric) & !mean_ndmi &!n_pixels, \(x) as.numeric(scale(x)))) 
 
 ndvi_lme_data <- wider_data_ndvi |>
     drop_na(mean_ndvi, type, cumulative_monthly_precip, mean_monthly_max_temp, mean_monthly_mean_temp, precip_lag1, precip_lag2, max_temp_lag1, max_temp_lag2, mean_temp_lag1, mean_temp_lag2)
@@ -80,9 +80,9 @@ ggplot(data=wider_data_ndmi, aes())
 use max temp for the lme:
 
 ```{r}
-ndvi_lme <- lmer(mean_ndvi ~ . - month - name -year - year_month + (1|month) + (1|name), data=ndvi_lme_data)
+ndvi_lme <- lmer(mean_ndvi ~ . - month - name -year - year_month - n_pixels -time + (1|month) + (1|name), data=ndvi_lme_data)
 
-ndmi_lme <- lmer(mean_ndmi ~ . -month - name -year - year_month + (1|month) + (1|name), data=ndmi_lme_data)
+ndmi_lme <- lmer(mean_ndmi ~ . -month - name -year - year_month - n_pixels -time + (1|month) + (1|name), data=ndmi_lme_data)
 ```
 
 checking resids:
@@ -93,5 +93,15 @@ qqnorm(resid(ndvi_lme))
 qqline(resid(ndvi_lme))
 lattice::qqmath(ranef(ndvi_lme))                     
 acf(resid(ndvi_lme)[order(ndvi_lme_data$name, ndvi_lme_data$year_month)]) 
+
+```
+
+what are the outliers at the bottom?
+
+```{r}
+ndvi_lme_data |>
+    mutate(resid = resid(ndvi_lme)) |>
+    arrange(resid) |>
+    select(name, year_month, mean_ndvi, n_pixels, resid)
 
 ```
