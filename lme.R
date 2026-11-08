@@ -1,16 +1,19 @@
 # ==============================================================================
-# BL5233 Group Project: Complete LMM & Drought Resilience Analysis Script
-# Project Title: NDVI Response to Drought Stress Across Singapore Park Types
+# BL5233 Group Project: Data Analysis R script
+# Project Title: Investigating the effects of weather conditions on Singapore’s nature parks
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
 # 1. Load Required R Libraries
 # ------------------------------------------------------------------------------
-library(lme4)        # Linear Mixed-Effects Models (lmer)
-library(lattice)     # Variance for levels of random effect
-library(ggplot2)     # Presentation-ready visualizations
-library(dplyr)
+library(lmerTest)       
+library(lattice)     
+library(tidyverse)
+library(tsibble)
+library(DHARMa)
+library(emmeans)
 library(ggplot2)
+setwd(dirname(rstudioapi::getSourceEditorContext()$path)) # Run if script same folder as data
 
 # ------------------------------------------------------------------------------
 # 2. Data Ingestion, Inspection & Standardization
@@ -21,85 +24,121 @@ urban_parks <- c("ADMIRALTY PK", "BUKIT BATOK NATURE PARK", "BUKIT BATOK TOWN PA
 buffer_parks <- c("CHESTNUT NATURE PARK", "RIFLE RANGE NATURE PARK", "WINDSOR NATURE PARK",
                   "THOMSON NATURE PARK", "DAIRY FARM NATURE PARK")
 
-data <- read.csv("data/csv/parks_all_years.csv")
+parks <- read_csv("parks_all_years.csv", col_names=TRUE) |> # Change csv here if different name
+  mutate(
+    year_month = tsibble::make_yearmonth(year = year, month = month),
+    time = as.numeric(year_month - min(year_month))
+  ) 
+wider_data_ndvi <- parks |>
+  filter(variable != "ndmi")|>
+  mutate(type = if_else(name %in% urban_parks, 1, 0)) %>%                
+  pivot_wider(id_cols = c(name, year, month, type, year_month),
+              names_from = stats,
+              values_from = value) |>
+  mutate(across(c(name, type, year, month), \(x)as.factor(x))) |>
+  select(name, month, year, year_month, type, mean_ndvi, cumulative_monthly_precip,mean_monthly_max_temp,mean_monthly_mean_temp, n_pixels) |>
+  arrange(name, year_month) |>
+  group_by(name) |>
+  mutate(precip_lag1 = dplyr::lag(cumulative_monthly_precip, 1),
+         precip_lag2 = dplyr::lag(cumulative_monthly_precip, 2),
+         max_temp_lag1 = dplyr::lag(mean_monthly_max_temp, 1),
+         max_temp_lag2 = dplyr::lag(mean_monthly_max_temp, 2),
+         mean_temp_lag1 = dplyr::lag(mean_monthly_mean_temp, 1),
+         mean_temp_lag2 = dplyr::lag(mean_monthly_mean_temp, 2)) |>
+  filter(!is.na(mean_ndvi)) |>
+  ungroup() |>
+  mutate(across(where(is.numeric) & !mean_ndvi &!n_pixels, \(x) as.numeric(scale(x))))
 
-data <- data %>% filter(stats %in% c("mean_ndvi", "mean_ndmi", "mean_monthly_mean_temp", "cumulative_monthly_precip")) %>%
-  mutate(type = if_else(name %in% urban_parks, 1, 0)) %>%                # Add column for type information
-  reshape(idvar = c("name", "year", "month", "type"), timevar = "stats", # Reformatting for fitting
-                    v.names = "value", direction = "wide") %>%
-  rename(park = name, NDVI = value.mean_ndvi, NDMI = value.mean_ndmi,
-         temp = value.mean_monthly_mean_temp, precip = value.cumulative_monthly_precip) %>%
-  select(park, type, year, month, NDVI, NDMI, temp, precip) %>%
-  filter(!is.na(NDMI), !is.na(precip), !is.na(temp),                     # Remove entries with NAs
-         !is.na(type), !is.na(month), !is.na(park))                      # 720 input, 638 output
+wider_data_ndmi <- parks |>
+  filter(variable != "ndvi")|>
+  mutate(type = if_else(name %in% urban_parks, 1, 0)) %>%                
+  pivot_wider(id_cols = c(name, year, month, type, year_month),
+              names_from = stats,
+              values_from = value) |>
+  mutate(across(c(name, type, year, month), \(x)as.factor(x))) |>
+  select(name, month, year, type, year_month, mean_ndmi, cumulative_monthly_precip,mean_monthly_max_temp,mean_monthly_mean_temp,n_pixels) |>
+  arrange(name, year_month) |>
+  group_by(name) |>
+  mutate(precip_lag1 = dplyr::lag(cumulative_monthly_precip, 1),
+         precip_lag2 = dplyr::lag(cumulative_monthly_precip, 2),
+         max_temp_lag1 = dplyr::lag(mean_monthly_max_temp, 1),
+         max_temp_lag2 = dplyr::lag(mean_monthly_max_temp, 2),
+         mean_temp_lag1 = dplyr::lag(mean_monthly_mean_temp, 1),
+         mean_temp_lag2 = dplyr::lag(mean_monthly_mean_temp, 2)) |>
+  filter(!is.na(mean_ndmi)) |>
+  ungroup() |>
+  mutate(across(where(is.numeric) & !mean_ndmi &!n_pixels, \(x) as.numeric(scale(x)))) 
 
-# Ensure factor data types
-data$park <- as.factor(data$park)
-data$type <- as.factor(data$type)
-data$month <- as.factor(data$month)
-
-# Scaling
-data$precip_sc <- as.numeric(scale(data$precip))
-data$temp_sc <- as.numeric(scale(data$temp))
-par(mfrow = c(2,2))
-ggplot(data=data, aes(x=temp_sc,y=NDVI))+ geom_point()
-ggplot(data=data, aes(x=precip_sc,y=NDVI))+ geom_point()
-ggplot(data=data, aes(x=temp_sc,y=NDMI))+ geom_point()
-ggplot(data=data, aes(x=precip_sc,y=NDMI))+ geom_point()
-# Feel like there's no clear pattern for this
+ndvi_lme_data <- wider_data_ndvi |>
+  drop_na(mean_ndvi, type, cumulative_monthly_precip, mean_monthly_max_temp, mean_monthly_mean_temp, precip_lag1, precip_lag2, max_temp_lag1, max_temp_lag2, mean_temp_lag1, mean_temp_lag2)
 
 # ------------------------------------------------------------------------------
 # 3. Model fitting and checks
 # ------------------------------------------------------------------------------
-# Fitting
-mod1 <- lmer(NDVI ~ precip_sc*temp_sc*type + (1 | month) + (1 | park), data = data)
-mod1_step <- step(mod1) # All exp variables removed
+## Model fitting ##
+# Inital
+ndvi_temp_precip <- lmer(mean_ndvi ~ type * (cumulative_monthly_precip + precip_lag1 + precip_lag2 + mean_monthly_max_temp + mean_monthly_mean_temp) +
+                           (1|month) + (1|name),
+                         data = ndvi_lme_data, REML = FALSE)
+final_model_temp_ndvi <- lmerTest::step(ndvi_temp_precip) # Final model is ~ type + precip_lag1 + + (1 | month) + (1 | name) + type:precip_lag1
 
-# Manual NDVI
-mod1.1 <- update(mod1,~.-precip_sc:temp_sc:type)
-summary(mod1.1)
-mod1.2 <- update(mod1.1,~.-precip_sc:type)
-summary(mod1.2)
-mod1.3 <- update(mod1.2,~.-temp_sc:type)
-summary(mod1.3)
-mod1.4 <- update(mod1.3,~.-temp_sc:precip_sc)
-summary(mod1.4)
-mod1.5 <- update(mod1.4,~.-precip_sc)
-summary(mod1.5)
-mod1.6 <- update(mod1.5,~.-temp_sc)
-summary(mod1.6) # Only type significant
+# Final
+final_model_ndvi <- lmer(mean_ndvi ~ type + precip_lag1 + (1 | month) + (1 | name) + type:precip_lag1,
+                         data = ndvi_lme_data, REML = FALSE)
 
-mod2 <- lmer(NDMI ~ precip_sc*temp_sc*type + (1 | month) + (1 | park), data = data)
-mod2_step <- step(mod2) # All exp variables removed
+# Test significance precipitation slope with emtrends
+emtrends(final_model_ndvi, ~ type, var = "precip_lag1")
+test(emtrends(final_model_ndvi, ~ type, var = "precip_lag1"))
 
-# Manual NDMI
-mod2.1 <- update(mod2,~.-precip_sc:temp_sc:type)
-summary(mod2.1)
-mod2.2 <- update(mod2.1,~.-precip_sc:temp_sc)
-summary(mod2.2)
-mod2.3 <- update(mod2.2,~.-temp_sc:type)
-summary(mod2.3)
-mod2.4 <- update(mod2.3,~.-type:precip_sc)
-summary(mod2.4)
-mod2.5 <- update(mod2.4,~.-temp_sc)
-summary(mod2.5)
-mod2.6 <- update(mod2.5,~.-type)
-summary(mod2.6) # Only precip significant
+## Plots for results ##
+# 1. Boxplot of NDVI by Park Type
+ggplot(ndvi_lme_data, aes(x = type, y = mean_ndvi, fill = type)) +
+  geom_boxplot() +
+  scale_x_discrete(labels = c("Buffer", "Urban")) +
+  labs(title = "Mean Monthly NDVI by Park Type" , x = "Park type", y = "Mean NDVI") +
+  theme_classic() +
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5))
 
-# Checks
-#Variance for levels of random effect
-plot(mod1.6,resid(.,scaled=T)~fitted(.)
-     |month,abline=0,lty=2)
+# 1. Interaction plot
+# Generate prediction data
+pred_data <- expand.grid(precip_lag1 = seq(
+    min(ndvi_lme_data$precip_lag1),
+    max(ndvi_lme_data$precip_lag1),
+    length.out = 100), type = levels(ndvi_lme_data$type))
 
-plot(mod1.6,resid(.,scaled=T)~fitted(.)
-     |park,abline=0,lty=2)
+# Predict NDVI using fixed effects only
+pred_data$predicted_ndvi <- predict(
+  final_model_ndvi,
+  newdata = pred_data,
+  re.form = NA)
 
-#Normality for whole dataset
-qqmath(mod1.6,lty=2)
+# Plot
+ggplot() +
+  geom_point(data = ndvi_lme_data,
+    aes(x = precip_lag1, y = mean_ndvi, colour = type),
+    alpha = 0.2) +
+  geom_line(data = pred_data,
+    aes(x = precip_lag1, y = predicted_ndvi, colour = type),
+    linewidth = 1.2) +
+  scale_colour_discrete(labels = c("Buffer", "Urban")) +
+  labs(title = "Effect of Rainfall 1-month Lag and Mean Monthly NDVI by Park Type",
+       x = "Rainfall 1-month Lag", y = "Mean NDVI", colour = "Park type") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
 
-#Normality for levels of random effect
-qqmath(~ resid(mod1.6, scaled = T) | park,
-  data = data, abline = c(0, 1))
-qqmath(~ resid(mod1.6, scaled = T) | month,
-  data = data, abline = c(0, 1))[3]
+
+## Diagnostic plots ##
+# Linearity and homoscedasticity of overall data
+plot(ndvi_temp_precip, main = "Residuals vs Fitted Values") 
+
+# Normality of overall dataset
+qqnorm(resid(ndvi_temp_precip), main = "Normal Q-Q Plot of Residuals")
+qqline(resid(ndvi_temp_precip))
+
+# Normality of residuals within levels of random effects
+lattice::qqmath(ranef(ndvi_temp_precip))$month                  
+lattice::qqmath(ranef(ndvi_temp_precip))$name
+
+# Temporal autocorrelation
+acf(resid(ndvi_temp_precip)[order(ndvi_lme_data$name, ndvi_lme_data$year_month)]) 
 
