@@ -5,6 +5,8 @@ library(lattice)
 library(tidyverse)
 library(tsibble)
 library(DHARMa)
+library(emmeans)
+library(ggplot2)
 ```
 
 parks type:
@@ -74,6 +76,32 @@ plot plot plot
 
 ```{r}
 ggplot(data=wider_data_ndmi, aes())
+ggplot(ndvi_lme_data, aes(x = type, y = mean_ndvi, fill = type)) +
+  geom_boxplot() +
+  scale_x_discrete(labels = c("Buffer", "Urban")) +
+  labs(title = "Mean Monthly NDVI by Park Type" , x = "Park type", y = "Mean NDVI") +
+  theme_classic() +
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5))
+pred_data <- expand.grid(precip_lag1 = seq(
+    min(ndvi_lme_data$precip_lag1),
+    max(ndvi_lme_data$precip_lag1),
+    length.out = 100), type = levels(ndvi_lme_data$type))
+pred_data$predicted_ndvi <- predict(
+  final_model_ndvi,
+  newdata = pred_data,
+  re.form = NA)
+ggplot() +
+  geom_point(data = ndvi_lme_data,
+    aes(x = precip_lag1, y = mean_ndvi, colour = type),
+    alpha = 0.2) +
+  geom_line(data = pred_data,
+    aes(x = precip_lag1, y = predicted_ndvi, colour = type),
+    linewidth = 1.2) +
+  scale_colour_discrete(labels = c("Buffer", "Urban")) +
+  labs(title = "Effect of Rainfall 1-month Lag and Mean Monthly NDVI by Park Type",
+       x = "Rainfall 1-month Lag", y = "Mean NDVI", colour = "Park type") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
 ```
 
 
@@ -178,3 +206,8 @@ no_lag_mod <- lmer(mean_ndvi ~ type + (1 | month) + (1 | name), data=ndvi_lme_da
 AIC(no_temp_mod, temp_lag_mod, temp_mod,ndvi_precip,final_model_temp_ndvi,no_lag_mod)
 ```
 
+Final model: Evaluate significance of slope (previous month rainfall) by park type
+```{r}
+emtrends(final_model_temp_ndvi, ~ type, var = "precip_lag1")
+test(emtrends(final_model_ndvi, ~ type, var = "precip_lag1"))
+```
